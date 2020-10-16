@@ -11,16 +11,10 @@
 
 
  /****************************************************************************
- * CaeUnsTAU implementation of runtimeWrite(), runtimeCreate(), and
- * runtimeDestroy()
- * 
- * more info in SPR 4411
- * 
- * TAU require an external library, netcdf, that has been linked in.
- * The API for netcdf can be found here: 
- * http:// www.unidata.ucar.edu/software/netcdf/docs/netcdf-c/
- * In addition, netcdf links against hdf5 and zlib, so those binaries must be
- * included.
+ * TAU requires the following third party libraries.
+ *    netcdf: https://www.unidata.ucar.edu/downloads/netcdf/
+ *    hdf5  : https://www.hdfgroup.org/
+ *    zlib  : http://www.zlib.net/
  * 
  * In netcdf, a set of 'dimensions' (referred to by a unique integer 'dimid') is
  * used to create a 'variable' (referred to by a unique integer 'varid'). Both
@@ -34,6 +28,8 @@
  * 
  * All functions in this module return true on success and false if an error
  * occurs.
+ *
+ * More info at WISH http://youtrack:8080/issue/PW-4411
  *
  ***************************************************************************/
 
