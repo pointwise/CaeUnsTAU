@@ -12,7 +12,7 @@ versions may work but have not been tested.
  * [netcdf v4.6.1][netcdf]
  * [hdf5 v1.8.20][hdf5]
  * [zlib v1.2.8][zlib]
-   * Usually, zlib is only downloaded for win64 builds. The `libz` library is usually part of the OS on linux and macosx platforms.
+   * Usually, zlib is only downloaded for win64 builds. The `libz` library is already installed with most linux and macosx distibutions.
 
 You must add the appropriate include path and link library settings to your TAU plugin project when building with Visual Studio on win64.
 
