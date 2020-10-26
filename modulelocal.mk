@@ -38,6 +38,9 @@
 #
 CaeUnsTAU_INCL_PRIVATE := \
 	-I./external/common/netcdf \
+	-I./external/common/hdf5 \
+	-I./external/$(machine)/hdf5 \
+	-I./external/common/zlib \
 	$(NULL)
 
 #-----------------------------------------------------------------------

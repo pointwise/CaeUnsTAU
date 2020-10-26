@@ -40,102 +40,250 @@
 #include "runtimeWrite.h"
 #include "pwpPlatform.h"
 
-#include <assert.h>
 
-// DO NOT CHANGE THE ORDER OF INCLUSION FOR THE FILES BELOW!
+ // DO NOT CHANGE THE ORDER OF INCLUSION FOR THE FILES BELOW!
 // <string>, <map>, and <netcdf.h> MUST be included in the order they are below
 #include <string.h>
 #include <string>
 #include <map>
 #include <netcdf.h>
+#include <array>
+#include <hdf5.h>
+#include <memory>
+#include <sstream>
+#include <zlib.h>
 
 
-typedef std::map<std::string, PWP_UINT32>   StringUINT32Map;
-typedef std::map<std::string, std::string>  StringStringMap;
+using StringUINT32Map = std::map<std::string, PWP_UINT32>;
+using StringStringMap = std::map<std::string, std::string>;
 
-struct TAU_DATA {
-    // Main dimensions
-    unsigned int    numPoints;
-    unsigned int    numElements;
-    unsigned int    numTets;
-    unsigned int    numPyramids;
-    unsigned int    numWedges;
-    unsigned int    numHexes;
-    unsigned int    numBars;
-    unsigned int    numSurfaceElements;
-    unsigned int    numSurfaceTris;
-    unsigned int    numSurfaceQuads;
-    int             numSurfBndryMarkers;
 
-    // Marker values
-    int             idNc;
-    int             idXc;
-    int             idYc;
-    int             idZc;
-    int             idTets;
-    int             idPyramids;
-    int             idPrisms;
-    int             idHexes;
-    int             markerId;
-    int             surfaceTriId;
-    int             surfaceQuadId;
-    int             bndryPanelStart;
-    int             bndryPanelTriStart;
-    int             bndryPanelQuadStart;
-    StringUINT32Map mapNameToOutputID;
-    StringStringMap mapNameToType;
-
-    // Used to track the indexing of hex and wedge creation during 2D export.
-    int             indexHex;
-    int             indexWedge;
-};
+enum class Orientation { Pos = 1, Neg = -1 };
 
 static const char *NetCDFDataModel = "DataModel";
 static const char *Thickness = "Thickness";
 
-#define OK(err)   (NC_NOERR == (err))
+#define OK(err)     (NC_NOERR == (err))
+
+// Make sure types are compatible for calls to nc_xxxx() functions
+static_assert(sizeof(int) == sizeof(PWP_UINT32), "int size mismatch");
+static_assert(sizeof(double) == sizeof(PWGM_XYZVAL), "double size mismatch");
+
+//****************************************************************************
+//****************************************************************************
+//****************************************************************************
+
+struct TAU_DATA {
+    TAU_DATA()
+    {
+        // nc_inq_libvers() returns "v.m.n other stuff". Trim off " other stuff"
+        netcdfVer = nc_inq_libvers();
+        netcdfVer  = netcdfVer.substr(0, netcdfVer.find(" "));
+
+        zlibVer = zlibVersion();
+
+        unsigned majnum = 0;
+        unsigned minnum = 0;
+        unsigned relnum = 0;
+        const herr_t err = H5get_libversion(&majnum, &minnum, &relnum);
+        if (err >= 0) {
+            std::ostringstream os;
+            os << majnum << "." << minnum << "." << relnum;
+            hdf5Ver = os.str();
+        }
+    }
+
+    // Main dimensions
+    PWP_UINT32      numPoints{ 0 };
+    PWP_UINT32      numElements{ 0 };
+    PWP_UINT32      numTets{ 0 };
+    PWP_UINT32      numPyramids{ 0 };
+    PWP_UINT32      numPrisms{ 0 };
+    PWP_UINT32      numHexes{ 0 };
+    PWP_UINT32      numBars{ 0 };
+    PWP_UINT32      numSurfaceElements{ 0 };
+    PWP_UINT32      numSurfaceTris{ 0 };
+    PWP_UINT32      numSurfaceQuads{ 0 };
+    PWP_INT32       numSurfBndryMarkers{ 0 };
+
+    // NetCdf file id values
+    int             idNc{ 0 };
+    int             idXc{ 0 };
+    int             idYc{ 0 };
+    int             idZc{ 0 };
+    int             idTets{ 0 };
+    int             idPyramids{ 0 };
+    int             idPrisms{ 0 };
+    int             idHexes{ 0 };
+    int             idTris{ 0 };
+    int             idQuads{ 0 };
+    int             idMarker{ 0 };
+
+    // Tracking values for elements created by extrusion during 2D export
+    int             extrudedTriStart{ 0 };
+    int             extrudedQuadStart{ 0 };
+
+    // Maps user-defined BC name to serialized TAU id
+    StringUINT32Map nameToId;
+
+    // Maps user-defined BC name to its TAU BC phsical type name
+    StringStringMap nameToType;
+
+    // Used to track the indexing of hex and prism creation during 2D export.
+    size_t          indexHex{ 0 };
+    size_t          indexPrism{ 0 };
+
+    // These values are for reference only. Not used by plugin.
+    std::string     netcdfVer;
+    std::string     zlibVer;
+    std::string     hdf5Ver;
+};
+
+
+//****************************************************************************
+//****************************************************************************
+//****************************************************************************
+
+template<size_t NumVerts, size_t BufSz>
+class ElemBuffer {
+    using BufType = std::unique_ptr<int[][NumVerts]>;
+
+public:
+    ElemBuffer(const int idNc, const int idArray) :
+        idNc_(idNc),
+        idArr_(idArray)
+    {
+    }
+
+    ~ElemBuffer()
+    {
+        flush();
+    }
+
+    bool add(const PWGM_ELEMDATA &data)
+    {
+        bool ret = ((BufSz == bufUsed_) ? flush() : true);
+        if (ret) {
+            for (PWP_UINT32 k = 0; k < NumVerts; ++k) {
+                buf_[bufUsed_][k] = (int)data.index[k];
+            }
+            ++ndx_;
+            ++bufUsed_;
+        }
+        return ret;
+    }
+
+    bool flush()
+    {
+        bool ret = true;
+        if (0 != bufUsed_) {
+            const size_t start[2]{
+                bufFirstNdx_,
+                0
+            };
+            const size_t count[2]{
+                bufUsed_,
+                NumVerts
+            };
+            ret = OK(nc_put_vara_int(idNc_, idArr_, start, count, &buf_[0][0]));
+            bufUsed_ = 0;
+            bufFirstNdx_ = ndx_;
+        }
+        return ret;
+    }
+
+private:
+    // netcdf mesh id
+    int         idNc_{ 0 };
+
+    // netcdf elemet array id
+    int         idArr_{ 0 };
+
+    // the element buffer
+    BufType     buf_{ new int[BufSz][NumVerts] };
+
+    // global serialized element index
+    PWP_UINT32  ndx_{ 0 };
+
+    // global serialized element index of first item in buf_
+    size_t      bufFirstNdx_{ 0 };
+
+    // number of elements waiting in buf_
+    PWP_UINT32  bufUsed_{ 0 };
+};
+
+
+static bool
+is2D(const CAEP_RTITEM &rti)
+{
+    return 0 != CAEPU_RT_DIM_2D(&rti);
+}
 
 
 /****************************************************************************
  * 
- * Initialize global condition information. It fills in the mapNameToOutputID
- * map and the mapNameToType map. For both, the keys are given by a value of
+ * Initialize global condition information. It fills in the nameToId
+ * map and the nameToType map. For both, the keys are given by a value of
  * condition.name, while the values are given by the corresponding call to
  * condition.tid and condition.type (respectively)
  * 
  ***************************************************************************/
-static PWP_BOOL
-setupMarkerInfo(CAEP_RTITEM *pRti)
+static bool
+setupMarkerInfo(const CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
-    StringUINT32Map &mapIds = tau.mapNameToOutputID;
-    StringStringMap &mapTypes = tau.mapNameToType;
+    TAU_DATA &tau = *(rti.tau);
+    bool ret = true;
     PWP_UINT32 nextID = 0;
-    PWP_UINT32 numDoms = PwModDomainCount(pRti->model);
-    for (PWP_UINT32 i = 0; i < numDoms && ret; ++i) {
-        PWGM_HDOMAIN dom = PwModEnumDomains(pRti->model, i);
-        PWGM_CONDDATA condition = {0};
+    const PWP_UINT32 NumDoms = PwModDomainCount(rti.model);
+    for (PWP_UINT32 i = 0; i < NumDoms && ret; ++i) {
+        PWGM_HDOMAIN dom = PwModEnumDomains(rti.model, i);
+        PWGM_CONDDATA condition{ 0 };
         ret = ret && PwDomCondition(dom, &condition);
-        if (ret && mapIds.find(condition.name) == mapIds.end()) {
-            mapIds[condition.name] = nextID;
-            nextID++;
-            mapTypes[condition.name] = condition.type;
+        if (ret && tau.nameToId.find(condition.name) == tau.nameToId.end()) {
+            tau.nameToId[condition.name] = nextID++;
+            tau.nameToType[condition.name] = condition.type;
         }
     }
-    // These are set for the 2D export only. The 2D faces will have the boundary
-    // condition of symmetry. These are the quads and tris only.
-    if ((ret && mapIds.find("Symmetry_1") == mapIds.end()) 
-        && CAEPU_RT_DIM_2D(pRti)) {
-            mapIds["Symmetry_1"] = nextID;
-            nextID++;
-            mapTypes["Symmetry_1"] = "Symmetry";
+    if (ret && is2D(rti)) {
+        // For 2D export, the grid is extruded to a 1-cell thick 3D grid.
+        // The original 2D base tri/quad elements are placed in the 'Symmetry_1'
+        // BC patch. The corresponding extruded top tri/quad elements are placed
+        // in the 'Symmetry_2' BC patch. The extruded side quads inherit their
+        // BC settings from the corresponding 2D boundary bar elements.
+        if (tau.nameToId.find("Symmetry_1") == tau.nameToId.end()) {
+            tau.nameToId["Symmetry_1"] = nextID++;
+            tau.nameToType["Symmetry_1"] = "Symmetry";
         }
-    if ((ret && mapIds.find("Symmetry_2") == mapIds.end()) 
-        && CAEPU_RT_DIM_2D(pRti)) {
-            mapIds["Symmetry_2"] = nextID;
-            mapTypes["Symmetry_2"] = "Symmetry";
+        if (tau.nameToId.find("Symmetry_2") == tau.nameToId.end()) {
+            tau.nameToId["Symmetry_2"] = nextID++;
+            tau.nameToType["Symmetry_2"] = "Symmetry";
         }
+    }
+    return ret;
+}
+
+
+static bool
+getDataModel(const CAEP_RTITEM &rti, int &dataModel)
+{
+    // NetCDF_Classic|NetCDF_64bit|NetCDF4_HDF5|
+    //              0|           1|           2|
+    PWP_UINT val = 0;
+    const bool ret = PwModGetAttributeUINT(rti.model, NetCDFDataModel, &val);
+    if (ret) {
+        switch (val) {
+        case 1:
+            dataModel = NC_64BIT_OFFSET;
+            break;
+        case 2:
+            dataModel = NC_NETCDF4;
+            break;
+        case 0:
+        default:
+            dataModel = 0;
+            break;
+        }
+    }
     return ret;
 }
 
@@ -146,34 +294,17 @@ setupMarkerInfo(CAEP_RTITEM *pRti)
  * global "type" attribute as requested by the TAU file format.
  * 
  ***************************************************************************/
-static PWP_BOOL
-startGridFile(CAEP_RTITEM *pRti)
+static bool
+startGridFile(const CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    char file[1024];
-    sprintf(file, "%s.grid", pRti->pWriteInfo->fileDest);
-
-    // NetCDF_Classic|NetCDF_64bit|NetCDF4_HDF5|
-    //              0|           1|           2|
-    PWP_UINT netCDFDataModel = 0;
-    PwModGetAttributeUINT(pRti->model, NetCDFDataModel, &netCDFDataModel);
+    TAU_DATA &tau = *(rti.tau);
+    std::string file(rti.pWriteInfo->fileDest);
+    file += ".grid";
     int dataModel = 0;
-    switch (netCDFDataModel) {
-    case 1:
-        dataModel = NC_64BIT_OFFSET;
-        break;
-    case 2:
-        dataModel = NC_NETCDF4;
-        break;
-    case 0:
-    default:
-        dataModel = 0;
-        break;
-    }
-
-    return OK(nc_create(file, NC_CLOBBER | dataModel, &tau.idNc)) &&
-        OK(nc_put_att_text(tau.idNc, NC_GLOBAL, "type", 24,
-        "Primary Grid: Tau Format"));
+    return getDataModel(rti, dataModel) &&
+           OK(nc_create(file.c_str(), NC_CLOBBER | dataModel, &tau.idNc)) &&
+           OK(nc_put_att_text(tau.idNc, NC_GLOBAL, "type", 24,
+               "Primary Grid: Tau Format"));
 }
 
 
@@ -184,30 +315,51 @@ startGridFile(CAEP_RTITEM *pRti)
  * the xyz coordinates of Pointwise vertices.
  * 
  ***************************************************************************/
-static PWP_BOOL
-definePointVars(CAEP_RTITEM *pRti)
+static bool
+definePointVars(const CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    int idNc = tau.idNc;
-    PWP_UINT32 numPoints = PwModVertexCount(pRti->model);
-    int idDim;
-    tau.numPoints = numPoints;
-    // If in 2D mode, the number of points is doubled.
-    // The points are doubled because the 2D faces will be extruded one step
-    // in either the positive z direction or the negative z direction. This will
-    // implicitly create a second set of points that are the exact same order as
-    // the original set, simply offset by the number of original points. The
-    // original set has 8 points 0-7 and the new set will have 8 points, 8-15
-    if(CAEPU_RT_DIM_2D(pRti))
-    {
-        numPoints *= 2;
-    }
-    
+    TAU_DATA &tau = *(rti.tau);
+
+    // capture number of points in the grid
+    tau.numPoints = PwModVertexCount(rti.model);
+
+    // If 2D, the number of points is doubled because the 2D faces will be
+    // extruded one step in either the +z or -z direction. This will implicitly
+    // create a second set of points that are the exact same order as the
+    // original set, simply offset by the number of original points.
+    // For instance, given a 2D grid with 8 points indexed 0-7, there will be 8
+    // extruded points index as 8-15.
+    const PWP_UINT32 NcNumPts = tau.numPoints * (is2D(rti) ? 2 : 1);
+
     // Create the no_of_points dimension and the XYZ coordinate vars
-    return OK(nc_def_dim(idNc, "no_of_points", numPoints, &idDim)) &&
-        OK(nc_def_var(idNc, "points_xc", NC_DOUBLE, 1, &idDim, &tau.idXc)) &&
-        OK(nc_def_var(idNc, "points_yc", NC_DOUBLE, 1, &idDim, &tau.idYc)) &&
-        OK(nc_def_var(idNc, "points_zc", NC_DOUBLE, 1, &idDim, &tau.idZc));
+    int id; // value ignored
+    return OK(nc_def_dim(tau.idNc, "no_of_points", NcNumPts, &id)) &&
+        OK(nc_def_var(tau.idNc, "points_xc", NC_DOUBLE, 1, &id, &tau.idXc)) &&
+        OK(nc_def_var(tau.idNc, "points_yc", NC_DOUBLE, 1, &id, &tau.idYc)) &&
+        OK(nc_def_var(tau.idNc, "points_zc", NC_DOUBLE, 1, &id, &tau.idZc));
+}
+
+
+/****************************************************************************
+ *
+ * Add the variables for an element type
+ *
+ ***************************************************************************/
+static bool
+defineElementVar(const int idNc, const char *numElemsLbl, const size_t numElems,
+    const char *ptsPerElemLbl, const size_t ptsPerElem, const char *idElemsLbl,
+    int &idElems)
+{
+    bool ret = true;
+    // make the two dimensions and variable for each shape type. Shape types
+    // with no instances do not get created (as in file-spec)
+    if (0 != numElems) {
+        int ids[2]{ 0, 0 };
+        ret = OK(nc_def_dim(idNc, numElemsLbl, numElems, &ids[0])) &&
+            OK(nc_def_dim(idNc, ptsPerElemLbl, ptsPerElem, &ids[1])) &&
+            OK(nc_def_var(idNc, idElemsLbl, NC_INT, 2, ids, &idElems));
+    }
+    return ret;
 }
 
 
@@ -221,110 +373,42 @@ definePointVars(CAEP_RTITEM *pRti)
  * important translations:
  * tetraeder: tetrahedron
  * pyramid: pyramid
- * prism: wedge
+ * prism: prism
  * hexaeder: hexahedron
  * 
  ***************************************************************************/
-static PWP_BOOL
-defineElementVars(CAEP_RTITEM *pRti)
+static bool
+defineElementVars(const CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
-    int idNc = tau.idNc;
+    TAU_DATA &tau = *(rti.tau);
 
     // count number of different element types
-    PWP_UINT32 numElements = 0;
-    PWP_UINT32 numTets = 0;
-    PWP_UINT32 numPyramids = 0;
-    PWP_UINT32 numPrisms = 0;
-    PWP_UINT32 numHexes = 0;
-
-    PWP_UINT32 numBlocks = PwModBlockCount(pRti->model);
-    for (PWP_UINT32 i = 0; i < numBlocks; ++i) {
-        PWGM_HBLOCK block = PwModEnumBlocks(pRti->model, i);
-        PWGM_ELEMCOUNTS elementCounts;
-        numElements += PwBlkElementCount(block, &elementCounts);
-        numTets += elementCounts.count[PWGM_ELEMTYPE_TET];
-        numPyramids += elementCounts.count[PWGM_ELEMTYPE_PYRAMID];
-        numPrisms += elementCounts.count[PWGM_ELEMTYPE_WEDGE];
-        numHexes += elementCounts.count[PWGM_ELEMTYPE_HEX];
+    tau.numElements = 0;
+    tau.numTets = 0;
+    tau.numPyramids = 0;
+    tau.numPrisms = 0;
+    tau.numHexes = 0;
+    const PWP_UINT32 NumBlocks = PwModBlockCount(rti.model);
+    PWGM_ELEMCOUNTS elementCounts;
+    for (PWP_UINT32 i = 0; i < NumBlocks; ++i) {
+        PWGM_HBLOCK hBlk = PwModEnumBlocks(rti.model, i);
+        tau.numElements += PwBlkElementCount(hBlk, &elementCounts);
+        tau.numTets += elementCounts.count[PWGM_ELEMTYPE_TET];
+        tau.numPyramids += elementCounts.count[PWGM_ELEMTYPE_PYRAMID];
+        tau.numPrisms += elementCounts.count[PWGM_ELEMTYPE_WEDGE];
+        tau.numHexes += elementCounts.count[PWGM_ELEMTYPE_HEX];
     }
 
-    // copy counts to pRti for use later.
-    tau.numElements = numElements;
-    tau.numTets = numTets;
-    tau.numPyramids = numPyramids;
-    tau.numWedges = numPrisms;
-    tau.numHexes = numHexes;
-
-    // note that idElemDim is not used in a variable; this is requested by the
-    // file-specs
-    int idElemDim = 0;
-    ret = OK(nc_def_dim(idNc, "no_of_elements", numElements, &idElemDim));
-
-    // make the two dimensions and variable for each shape type. Shape types
-    // with no instances do not get created (as in file-spec)
-    if (ret && numTets != 0) {
-        // create # of tetraeders dimension
-        int idNumTets = 0;
-        ret = ret && OK(nc_def_dim(idNc, "no_of_tetraeders", numTets,
-            &idNumTets));
-
-        // create points per tetraeder dimension
-        int idPtsPerTet = 0;
-        ret = ret && OK(nc_def_dim(idNc, "points_per_tetraeder", 4,
-            &idPtsPerTet));
-
-        // create the points-of-tetraeders variable based on its two dimensions
-        int dimids[2] = { idNumTets, idPtsPerTet };
-        ret = ret && OK(nc_def_var(idNc, "points_of_tetraeders", NC_INT, 2,
-            dimids, &tau.idTets));
-    }
-    if (ret && numPyramids != 0) {
-        // see comments in 'if (numTets != 0)' section
-        int idNumPyr = 0;
-        ret = ret && OK(nc_def_dim(idNc, "no_of_pyramids", numPyramids,
-            &idNumPyr));
-
-        int idPtsPerPyr = 0;
-        ret = ret && OK(nc_def_dim(idNc, "points_per_pyramid", 5,
-            &idPtsPerPyr));
-
-        int dimids[2] = { idNumPyr, idPtsPerPyr };
-        ret = ret && OK(nc_def_var(idNc, "points_of_pyramids", NC_INT, 2,
-            dimids, &tau.idPyramids));
-    }
-    if (ret && numPrisms != 0) {
-        // see comments in 'if (numTets != 0)' section
-        int idNumPrism = 0;
-        ret = ret && OK(nc_def_dim(idNc, "no_of_prisms", numPrisms,
-            &idNumPrism));
-
-        int idPtsPerPrism = 0;
-        ret = ret && OK(nc_def_dim(idNc, "points_per_prism", 6,
-            &idPtsPerPrism));
-
-        int dimids[2] = { idNumPrism, idPtsPerPrism };
-        ret = ret && OK(nc_def_var(idNc, "points_of_prisms", NC_INT, 2, dimids,
-            &tau.idPrisms));
-    }
-    if (ret && numHexes != 0) {
-        // see comments in 'if (numTets != 0)' section
-        // (hexaeders are 'hexes' in pointwise)
-        int idNumHex = 0;
-        ret = ret && OK(nc_def_dim(idNc, "no_of_hexaeders", numHexes,
-            &idNumHex));
-
-        int idPtsPerHex = 0;
-        ret = ret && OK(nc_def_dim(idNc, "points_per_hexaeder", 8,
-            &idPtsPerHex));
-
-        int dimids[2] = { idNumHex, idPtsPerHex };
-        ret = ret && OK(nc_def_var(idNc, "points_of_hexaeders", NC_INT, 2,
-            dimids, &tau.idHexes));
-    }
-
-    return ret;
+    int id = 0; // don't need this
+    return OK(nc_def_dim(tau.idNc, "no_of_elements", tau.numElements, &id)) &&
+        defineElementVar(tau.idNc, "no_of_tetraeders", tau.numTets,
+            "points_per_tetraeder", 4, "points_of_tetraeders", tau.idTets) &&
+        defineElementVar(tau.idNc, "no_of_pyramids", tau.numPyramids,
+            "points_per_pyramid", 5, "points_of_pyramids", tau.idPyramids) &&
+        defineElementVar(tau.idNc, "no_of_prisms", tau.numPrisms,
+            "points_per_prism", 6, "points_of_prisms", tau.idPrisms) &&
+        defineElementVar(tau.idNc, "no_of_hexaeders", tau.numHexes,
+            "points_per_hexaeder", 8, "points_of_hexaeders", tau.idHexes);
 }
 
 
@@ -337,17 +421,14 @@ defineElementVars(CAEP_RTITEM *pRti)
  * Defines a marker attribute based on the condition name and id of a marker.
  * 
  ***************************************************************************/
-PWP_BOOL
-defineOneMarker(CAEP_RTITEM *pRti, const char *name, const int id)
+static bool
+defineOneMarker(const CAEP_RTITEM &rti, const char *name, const int id)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
-    int idNc = tau.idNc;
-    char attributeName[10];
-    ret = 0 < sprintf(attributeName, "marker_%d", id);
-    size_t len = strlen(name) + 1;// add one for null character
-    return ret && OK(nc_put_att_text(idNc, NC_GLOBAL, attributeName, len,
-        name));
+    const TAU_DATA &tau = *(rti.tau);
+    char attrName[10];
+    const size_t len = strlen(name) + 1; // +1 for null character
+    return (0 < sprintf(attrName, "marker_%d", id)) &&
+        OK(nc_put_att_text(tau.idNc, NC_GLOBAL, attrName, len, name));
 }
 
 
@@ -359,30 +440,25 @@ defineOneMarker(CAEP_RTITEM *pRti, const char *name, const int id)
  * using the 'defineOneMarker()' function).
  * 
  ***************************************************************************/
-PWP_BOOL
-defineMarkers(CAEP_RTITEM *pRti)
+static bool
+defineMarkers(const CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
-    int idNc = tau.idNc;
-    int numMarkers = (int)tau.mapNameToOutputID.size();
+    TAU_DATA &tau = *(rti.tau);
     int ncNumMarkers = 0;
-
-    ret = ret && OK(nc_def_dim(idNc, "no_of_markers", numMarkers,
-        &ncNumMarkers));
-
-    int dimids[1] = { ncNumMarkers };
-    ret = ret && OK(nc_def_var(idNc, "marker", NC_INT, 1, dimids,
-        &(tau.markerId)));
-
-    StringUINT32Map &nameMap = tau.mapNameToOutputID;
-    StringUINT32Map::iterator iter;
-    for (iter = nameMap.begin(); iter != nameMap.end() && ret; ++iter) {
-        const char *key = iter->first.c_str();
-        PWP_UINT32 value = iter->second;
-        ret = ret && defineOneMarker(pRti, key, value);
+    bool ret = OK(nc_def_dim(tau.idNc, "no_of_markers", tau.nameToId.size(),
+        &ncNumMarkers)) && OK(nc_def_var(tau.idNc, "marker", NC_INT, 1,
+            &ncNumMarkers, &tau.idMarker));
+    if (ret) {
+        StringUINT32Map::const_iterator it = tau.nameToId.begin();
+        for (; it != tau.nameToId.end(); ++it) {
+            const char *key = it->first.c_str();
+            const PWP_UINT32 value = it->second;
+            if (!defineOneMarker(rti, key, value)) {
+                ret = false;
+                break;
+            }
+        }
     }
-
     return ret;
 }
 
@@ -397,20 +473,18 @@ defineMarkers(CAEP_RTITEM *pRti)
  * their associated variables.
  * 
  ***************************************************************************/
-static PWP_BOOL
-defineSurfaceElementVars(CAEP_RTITEM *pRti)
+static bool
+defineSurfaceElementVars(const CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
-    int idNc = tau.idNc;
+    TAU_DATA &tau = *(rti.tau);
+    const int idNc = tau.idNc;
 
     // count number of different surface-element types
-    PWP_UINT32 numSurfaceElements = 0;
     PWP_UINT32 numSurfaceTriangles = 0;
     PWP_UINT32 numSurfaceQuadrilaterals = 0;
-    PWP_UINT32 numDomains = PwModDomainCount(pRti->model);
+    PWP_UINT32 numDomains = PwModDomainCount(rti.model);
     for (PWP_UINT32 i = 0; i < numDomains; ++i) {
-        PWGM_HDOMAIN domain = PwModEnumDomains(pRti->model, i);
+        PWGM_HDOMAIN domain = PwModEnumDomains(rti.model, i);
         PWGM_ELEMCOUNTS elementCounts;
         PwDomElementCount(domain, &elementCounts);
         numSurfaceTriangles += elementCounts.count[PWGM_ELEMTYPE_TRI];
@@ -418,22 +492,20 @@ defineSurfaceElementVars(CAEP_RTITEM *pRti)
     }
     // DO NOT use return value from pwDomElementCount, as it includes bar 
     // elements as surface elements
-    numSurfaceElements = numSurfaceTriangles + numSurfaceQuadrilaterals;
-
-    tau.numSurfaceElements = numSurfaceElements;
+    tau.numSurfaceElements = numSurfaceTriangles + numSurfaceQuadrilaterals;
 
     // create dimension for total number of surface elements
     int ncNumSurfaceElements = 0;
-    ret = ret && OK(nc_def_dim(idNc, "no_of_surfaceelements",
-        numSurfaceElements, &ncNumSurfaceElements));
+    bool ret = OK(nc_def_dim(idNc, "no_of_surfaceelements",
+        tau.numSurfaceElements, &ncNumSurfaceElements));
 
     // create variables (and related dimensions) for each type of surface
     // element
-    if (ret && numSurfaceTriangles != 0) {
+    if (ret && (0 != numSurfaceTriangles)) {
         // create an id for the no_of_surfacetriangles dimension
         int ncSurfaceTriangles = 0;
-        ret = ret && OK(nc_def_dim(idNc, "no_of_surfacetriangles",
-            numSurfaceTriangles, &ncSurfaceTriangles));
+        ret = OK(nc_def_dim(idNc, "no_of_surfacetriangles", numSurfaceTriangles,
+            &ncSurfaceTriangles));
 
         // create an id for the points_per_surfacetriangle dimension
         int ncPointsPerTri = 0;
@@ -445,12 +517,12 @@ defineSurfaceElementVars(CAEP_RTITEM *pRti)
         // dimensions.
         int dimids[2] = { ncSurfaceTriangles, ncPointsPerTri };
         ret = ret && OK(nc_def_var(idNc, "points_of_surfacetriangles", NC_INT,
-            2, dimids, &(tau.surfaceTriId)));
+            2, dimids, &tau.idTris));
     }
-    if (ret && numSurfaceQuadrilaterals != 0) {
+    if (ret && (0 != numSurfaceQuadrilaterals)) {
         // see 'if (numSurfaceTriangles != 0)' comments
         int ncSurfaceQuads = 0;
-        ret = ret && OK(nc_def_dim(idNc, "no_of_surfacequadrilaterals",
+        ret = OK(nc_def_dim(idNc, "no_of_surfacequadrilaterals",
             numSurfaceQuadrilaterals, &ncSurfaceQuads));
 
         int ncPointsPerQuad = 0;
@@ -459,7 +531,7 @@ defineSurfaceElementVars(CAEP_RTITEM *pRti)
 
         int dimids[2] = { ncSurfaceQuads, ncPointsPerQuad };
         ret = ret && OK(nc_def_var(idNc, "points_of_surfacequadrilaterals",
-            NC_INT, 2, dimids, &(tau.surfaceQuadId)));
+            NC_INT, 2, dimids, &(tau.idQuads)));
     }
 
     // Define variable (netCDF multi-dimensional array) that associates
@@ -468,15 +540,15 @@ defineSurfaceElementVars(CAEP_RTITEM *pRti)
 
     // Define variable for boundarymarkers
     ret = ret && OK(nc_def_var(idNc, "boundarymarker_of_surfaces", NC_INT, 1,
-        dimids, &(tau.numSurfBndryMarkers)));
+        dimids, &tau.numSurfBndryMarkers));
 
     // indexing scheme in the boundarypanel variable and in the 
     // boundarymarker variable saves the domain (boundary-panel) or 
     // boundary condition (boundary-marker) number of all the triangles
     // followed by the domain number of all the quads, so this indexing
     // tells us where these are.
-    tau.bndryPanelTriStart = 0;
-    tau.bndryPanelQuadStart = numSurfaceTriangles;
+    tau.extrudedTriStart = 0;
+    tau.extrudedQuadStart = numSurfaceTriangles;
     
     return ret;
 }
@@ -491,13 +563,13 @@ defineSurfaceElementVars(CAEP_RTITEM *pRti)
  * 
  ***************************************************************************/
 static PWP_UINT32
-defineDomainElements(CAEP_RTITEM *pRti)
+getNumExtrudedBndryBars(const CAEP_RTITEM &rti)
 {
+    PWGM_ELEMCOUNTS elementCounts;
     PWP_UINT32 totalBars = 0;
-    PWP_UINT32 numDomains = PwModDomainCount(pRti->model);
+    const PWP_UINT32 numDomains = PwModDomainCount(rti.model);
     for (PWP_UINT32 i = 0; i < numDomains; ++i) {
-        PWGM_HDOMAIN domain = PwModEnumDomains(pRti->model, i);
-        PWGM_ELEMCOUNTS elementCounts;
+        PWGM_HDOMAIN domain = PwModEnumDomains(rti.model, i);
         PwDomElementCount(domain, &elementCounts);
         totalBars += elementCounts.count[PWGM_ELEMTYPE_BAR];
     }
@@ -513,12 +585,10 @@ defineDomainElements(CAEP_RTITEM *pRti)
  * be double as well but with the addition of the extruded bars.
  * 
  ***************************************************************************/
-static PWP_BOOL
-defineElementVars2D(CAEP_RTITEM *pRti)
+static bool
+defineElementVars2D(const CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
-    int idNc = tau.idNc;
+    TAU_DATA &tau = *(rti.tau);
 
     // count number of different surface-element types
     PWP_UINT32 numSurfaceElements = 0;
@@ -526,12 +596,12 @@ defineElementVars2D(CAEP_RTITEM *pRti)
     PWP_UINT32 numSurfaceQuadrilaterals = 0;
     PWP_UINT32 numHexes = 0;
     PWP_UINT32 numPrisms = 0;
-    PWP_UINT32 numBlocks = PwModBlockCount(pRti->model);
+    PWP_UINT32 numBlocks = PwModBlockCount(rti.model);
 
     for (PWP_UINT32 i = 0; i < numBlocks; ++i) {
-        PWGM_HBLOCK block = PwModEnumBlocks(pRti->model, i);
+        PWGM_HBLOCK hBlk = PwModEnumBlocks(rti.model, i);
         PWGM_ELEMCOUNTS elementCounts;
-        PwBlkElementCount(block, &elementCounts);
+        PwBlkElementCount(hBlk, &elementCounts);
 
         // Multiplying each set of elements by two because the 2D grid will
         // be virtually extruded, increasing the number of quads and tris by
@@ -545,30 +615,24 @@ defineElementVars2D(CAEP_RTITEM *pRti)
         numHexes += elementCounts.count[PWGM_ELEMTYPE_QUAD]; 
         numPrisms += elementCounts.count[PWGM_ELEMTYPE_TRI];
     }
-    // numBars is the total number of bars that when extruded, will become
-    // surface quads
-    PWP_UINT32 numBars=defineDomainElements(pRti);
 
     // All bars will become surface quadrilaterals
-    numSurfaceQuadrilaterals += numBars;
-
-    // Normal sum would be:
-    // numSurfaceTriangles + numSurfaceQuadrilaterals + numBars; But numBars
-    // is already added into the numSurfaceQuadrilaterals. This is done because
-    // the bars will be turned into quads upon extruding one step
+    numSurfaceQuadrilaterals += getNumExtrudedBndryBars(rti);
     numSurfaceElements = numSurfaceTriangles + numSurfaceQuadrilaterals;
 
     tau.numSurfaceElements = numSurfaceElements;
     tau.numSurfaceTris = numSurfaceTriangles;
     tau.numSurfaceQuads = numSurfaceQuadrilaterals;
     tau.numHexes = numHexes;
-    // Please note, wedges are the same as prisms in context of TAU.
-    tau.numWedges = numPrisms;
+    // Please note, prisms are the same as prisms in context of TAU.
+    tau.numPrisms = numPrisms;
+
+    const int idNc = tau.idNc;
 
     // create dimension for total number of surface elements
     int ncNumSurfaceElements = 0;
-    ret = ret && OK(nc_def_dim(idNc, "no_of_surfaceelements",
-        numSurfaceElements, &ncNumSurfaceElements));
+    bool ret = OK(nc_def_dim(idNc, "no_of_surfaceelements", numSurfaceElements,
+        &ncNumSurfaceElements));
 
     // create variables (and related dimensions) for each type of surface
     // element
@@ -588,7 +652,7 @@ defineElementVars2D(CAEP_RTITEM *pRti)
         // dimensions.
         int dimids[2] = { ncSurfaceTriangles, ncPointsPerTri };
         ret = ret && OK(nc_def_var(idNc, "points_of_surfacetriangles", NC_INT,
-            2, dimids, &(tau.surfaceTriId)));
+            2, dimids, &(tau.idTris)));
     }
     if (ret && numSurfaceQuadrilaterals != 0) {
         // see 'if (numSurfaceTriangles != 0)' comments
@@ -602,7 +666,7 @@ defineElementVars2D(CAEP_RTITEM *pRti)
 
         int dimids[2] = { ncSurfaceQuads, ncPointsPerQuad };
         ret = ret && OK(nc_def_var(idNc, "points_of_surfacequadrilaterals",
-            NC_INT, 2, dimids, &(tau.surfaceQuadId)));
+            NC_INT, 2, dimids, &(tau.idQuads)));
     }
     if (ret && numHexes != 0) {
         // see comments in 'if (numSurfaceTriangles != 0)' section
@@ -640,15 +704,15 @@ defineElementVars2D(CAEP_RTITEM *pRti)
 
     // Define variable for boundarymarkers
     ret = ret && OK(nc_def_var(idNc, "boundarymarker_of_surfaces", NC_INT, 1,
-        dimids, &(tau.numSurfBndryMarkers)));
+        dimids, &tau.numSurfBndryMarkers));
 
     // indexing scheme in the boundarypanel variable and in the 
     // boundarymarker variable saves the domain (boundary-panel) or 
     // boundary condition (boundary-marker) number of all the triangles
     // followed by the domain number of all the quads, so this indexing
     // tells us where these are.
-    tau.bndryPanelTriStart = 0;
-    tau.bndryPanelQuadStart = numSurfaceTriangles;
+    tau.extrudedTriStart = 0;
+    tau.extrudedQuadStart = numSurfaceTriangles;
     
     return ret;
 }
@@ -660,11 +724,10 @@ defineElementVars2D(CAEP_RTITEM *pRti)
  * variables are created), so that data can be written out to the file.
  * 
  ***************************************************************************/
-static PWP_BOOL
-endFileDefinition(CAEP_RTITEM *pRti)
+static bool
+endFileDefinition(const CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    return OK(nc_enddef(tau.idNc));
+    return OK(nc_enddef(rti.tau->idNc));
 }
 
 
@@ -675,140 +738,119 @@ endFileDefinition(CAEP_RTITEM *pRti)
  * the points for hexes is the same in Tau as it is in Pointwise.
  *
  ***************************************************************************/
-static PWP_BOOL
-createHexFromQuads(int offSetQuad[4], PWGM_ELEMDATA data, CAEP_RTITEM *pRti, 
-        int idNc ) {
-    PWP_BOOL ret = PWP_TRUE;
-    TAU_DATA &tau = *(pRti->tau);
-    size_t start[2] = { (size_t)tau.indexHex, 0 };
-    size_t count[2] = { 1, 8 };
-    int hexPoints[8];
-
-    hexPoints[0] = (int)data.index[0];
-    hexPoints[1] = (int)data.index[1];
-    hexPoints[2] = (int)data.index[2];
-    hexPoints[3] = (int)data.index[3];
+static bool
+createHexFromQuad(const CAEP_RTITEM &rti, const PWGM_ELEMDATA &data)
+{
+    const TAU_DATA &tau = *rti.tau;
+    const size_t start[2]{ tau.indexHex, 0 };
+    const size_t count[2]{ 1, 8 };
     // The points originally saved for the creation of the new quad are reversed
     // of the order expected for the TAU format. We are manually reversing the
     // order for the saves so that the hex has the right dimensions.
-    hexPoints[4] = (int)offSetQuad[0];
-    hexPoints[5] = (int)offSetQuad[1];
-    hexPoints[6] = (int)offSetQuad[2];
-    hexPoints[7] = (int)offSetQuad[3];
+    const int hexPoints[8]{
+        (int)data.index[0],
+        (int)data.index[1],
+        (int)data.index[2],
+        (int)data.index[3],
+        (int)(data.index[0] + tau.numPoints),
+        (int)(data.index[1] + tau.numPoints),
+        (int)(data.index[2] + tau.numPoints),
+        (int)(data.index[3] + tau.numPoints)
+    };
 
-    ret = ret && OK(nc_put_vara_int(idNc, tau.idHexes,
-                            start, count, &(hexPoints[0])));
-    return ret;
+    return OK(nc_put_vara_int(tau.idNc, tau.idHexes, start, count, hexPoints));
 }
 
 
 /****************************************************************************
  * 
- * Uses the points of a pair of triangles to create a wedge shape. Because of
+ * Uses the points of a pair of triangles to create a prism shape. Because of
  * the way triangles are defined in TAU format, the order of the points for the
  * second triangle must be the same direction as the points are defined to
  * maintain the normal facing away from the face.
  * 
  ***************************************************************************/
-static PWP_BOOL
-createWedgeFromTris(int offSetTri[3], PWGM_ELEMDATA data, CAEP_RTITEM *pRti, 
-        int idNc) {
-    PWP_BOOL ret = PWP_TRUE;
-    TAU_DATA &tau = *(pRti->tau);
-    size_t start[2] = { (size_t)tau.indexWedge, 0 };
-    size_t count[2] = { 1, 6 };
-    int wedgePoints[6],error;
-
-    wedgePoints[0] = (int)data.index[0];
-    wedgePoints[1] = (int)data.index[1];
-    wedgePoints[2] = (int)data.index[2];
-    wedgePoints[3] = (int)offSetTri[0];
-    wedgePoints[4] = (int)offSetTri[1];
-    wedgePoints[5] = (int)offSetTri[2];
-
-    error=nc_put_vara_int(idNc, tau.idPrisms, start, count, &(wedgePoints[0]));
-    ret = ret && OK(error);
-
-    return ret;
+static bool
+createPrismFromTri(const CAEP_RTITEM &rti, const PWGM_ELEMDATA &data)
+{
+    const TAU_DATA &tau = *rti.tau;
+    const size_t start[2]{ tau.indexPrism, 0 };
+    const size_t count[2]{ 1, 6 };
+    const int indices[6]{
+        (int)data.index[0],
+        (int)data.index[1],
+        (int)data.index[2],
+        (int)(data.index[0] + tau.numPoints),
+        (int)(data.index[1] + tau.numPoints),
+        (int)(data.index[2] + tau.numPoints)
+    };
+    return OK(nc_put_vara_int(tau.idNc, tau.idPrisms, start, count, indices));
 }
 
 
 /****************************************************************************
  * 
  * Uses the points of the original Quad and creates an offset Quad from the
- * vertices. The function then calls createHexFromQuads() to create the
- * associated hex elements. The original quads have their point order reversed
- * but the new quads maintain their original order because the normals must be
- * facing away from the model.
+ * vertices. The function then calls createHexFromQuad() to create the
+ * associated hex element. TAU boundary element normals must point out of the
+ * extruded volume. The PW convention is the opposite. As such, the original
+ * quad has its point order reversed and the extruded quad can use the original
+ * order.
  * 
  ***************************************************************************/
-static PWP_BOOL
-createQuadElement(PWP_UINT32 idxQuad, PWGM_ELEMDATA data, 
-        int idNc, CAEP_RTITEM *pRti) {
-    PWP_BOOL ret = PWP_TRUE;
-    size_t start[2] = { idxQuad, 0 };
-    size_t count[2] = { 1, 4 };
-    TAU_DATA &tau = *(pRti->tau);
-    int quadPoints[4];
-    PWP_UINT32 markerID = tau.mapNameToOutputID["Symmetry_2"];
-
-    // Creation of a new quad will share the same points as the original quad
-    // but will be offset by the number of original points.
-    quadPoints[0] = (int)data.index[0] + (int)tau.numPoints;
-    quadPoints[1] = (int)data.index[1] + (int)tau.numPoints;
-    quadPoints[2] = (int)data.index[2] + (int)tau.numPoints;
-    quadPoints[3] = (int)data.index[3] + (int)tau.numPoints;
-
-    ret &= OK(nc_put_vara_int(idNc, tau.surfaceQuadId, 
-            start, count, &(quadPoints[0])));
-
-    size_t adjustedIdx = idxQuad + tau.bndryPanelQuadStart;
-
-    ret = ret && OK(nc_put_var1_int(idNc,
-            tau.numSurfBndryMarkers, &adjustedIdx,
-            (int *)&(markerID)));
-
-    ret &= createHexFromQuads(quadPoints, data, pRti, idNc);
-    return ret;
+static bool
+createExtrudedQuadTopElement(const CAEP_RTITEM &rti, const PWP_UINT32 idxQuad,
+    const PWGM_ELEMDATA &data)
+{
+    // the extruded quad is just an offset of the original indices
+    const TAU_DATA &tau = *(rti.tau);
+    const size_t start[2]{ idxQuad, 0 };
+    const size_t count[2]{ 1, 4 };
+    const PWP_UINT32 markerID = tau.nameToId.at("Symmetry_2");
+    const size_t adjIdx = idxQuad + tau.extrudedQuadStart;
+    const int indices[4]{
+        (int)(data.index[0] + tau.numPoints),
+        (int)(data.index[1] + tau.numPoints),
+        (int)(data.index[2] + tau.numPoints),
+        (int)(data.index[3] + tau.numPoints)
+    };
+    return OK(nc_put_vara_int(tau.idNc, tau.idQuads, start, count,
+            indices)) &&
+        OK(nc_put_var1_int(tau.idNc, tau.numSurfBndryMarkers, &adjIdx,
+            (int*)&markerID)) &&
+        createHexFromQuad(rti, data);
 }
 
 
 /****************************************************************************
  * 
  * Uses the points of the original triangle and creates an offset triangle from
- * the vertices. The function then calls createWedgeFromTris() to create the
- * associated wedge elements. The triangle elements behave the same way as the
- * quad elements. Please see the comments in "createQuadElement".
+ * the vertices. The function then calls createPrismFromTri() to create the
+ * associated prism element. TAU boundary element normals must point out of the
+ * extruded volume. The PW convention is the opposite. As such, the original tri
+ * has its point order reversed and the extruded tri can use the original order.
  * 
  ***************************************************************************/
-static PWP_BOOL
-createTriElement(PWP_UINT32 idxTri, PWGM_ELEMDATA data, 
-        int idNc, CAEP_RTITEM *pRti) {
-    size_t start[2] = { idxTri, 0 };
-    size_t count[2] = { 1, 3 };
-    TAU_DATA &tau = *(pRti->tau);
-    int triPoints[3];
-    PWP_UINT32 markerID = tau.mapNameToOutputID["Symmetry_2"];
-    PWP_BOOL ret = PWP_TRUE;
-
-    // Creation of a new tri will share the same points as the original tri
-    // but will be offset by the number of original points.
-    triPoints[0] = (int)data.index[0] + (int)tau.numPoints;
-    triPoints[1] = (int)data.index[1] + (int)tau.numPoints;
-    triPoints[2] = (int)data.index[2] + (int)tau.numPoints;
-
-    size_t adjustedIdx = idxTri + tau.bndryPanelTriStart;
-
-    // save marker (Pointwise boundary-condition) information
-    ret = ret && OK(nc_put_var1_int(idNc,
-        tau.numSurfBndryMarkers, &adjustedIdx,
-        (int *)&(markerID)));
-
-    
-    ret &= createWedgeFromTris(triPoints,data,pRti,idNc);
-    ret &= OK(nc_put_vara_int(idNc, tau.surfaceTriId,
-            start, count, &(triPoints[0])));
-    return ret;
+static bool
+createExtrudedTriTopElement(const CAEP_RTITEM &rti, const PWP_UINT32 idxTri,
+    const PWGM_ELEMDATA &data)
+{
+    // the extruded tri is just an offset of the original indices
+    const TAU_DATA &tau = *rti.tau;
+    const size_t start[2]{ idxTri, 0 };
+    const size_t count[2]{ 1, 3 };
+    const PWP_UINT32 markerID = tau.nameToId.at("Symmetry_2");
+    const size_t adjIdx = idxTri + tau.extrudedTriStart;
+    const int indices[3]{
+        (int)(data.index[0] + tau.numPoints),
+        (int)(data.index[1] + tau.numPoints),
+        (int)(data.index[2] + tau.numPoints)
+    };
+    return OK(nc_put_vara_int(tau.idNc, tau.idTris, start, count,
+            indices)) &&
+        OK(nc_put_var1_int(tau.idNc, tau.numSurfBndryMarkers, &adjIdx,
+            (int*)&markerID)) &&
+        createPrismFromTri(rti, data);
 }
 
 
@@ -819,107 +861,60 @@ createTriElement(PWP_UINT32 idxTri, PWGM_ELEMDATA data,
  * conditions to the new surface quad.
  * 
  ***************************************************************************/
-PWP_BOOL
-writeQuadElementFromBar(PWP_UINT32 idxQuad, int idNc, CAEP_RTITEM *pRti) {
-    PWP_BOOL ret = PWP_TRUE;
-    TAU_DATA &tau = *(pRti->tau);
-    int quadPoints[4];
-    PWGM_ELEMDATA data = {PWGM_ELEMTYPE_BAR};
-    PWGM_CONDDATA boundaryCondition = {""};
-    PWP_UINT32 numDomains = PwModDomainCount(pRti->model);
-
-    for (PWP_UINT32 i = 0; i < numDomains && ret; ++i) {
-
-            PWGM_HDOMAIN domain = PwModEnumDomains(pRti->model, i);
-            
-            ret = ret && PwDomCondition(domain, &boundaryCondition);
-            PWP_UINT32 markerID =
-                    tau.mapNameToOutputID[boundaryCondition.name];
-            PWP_UINT32 numSurfaceElements = PwDomElementCount(domain, 0);
-
-            for (PWP_UINT32 j = 0; j < numSurfaceElements && ret; ++j) {
-                PWGM_HELEMENT surfaceElement = PwDomEnumElements(domain, j);
-
-                ret = ret && PwElemDataMod(surfaceElement, &data);
-
-                // assert to make sure int and data.index[0] are compatible for 
-                // calls to nc_put_vara_int (on surface-element information)
-                assert(sizeof(int) == sizeof(data.index[0]));
-
-                // assert to make sure int and PWP_UINT are compatible for 
-                // calls to nc_put_var1_int (on boundarypanel information)
-                assert(sizeof(int) == sizeof(PWP_UINT32));
-
-                // assert to make sure int and tid are compatible for 
-                // calls to nc_put_var1_int (on marker array)
-                assert(sizeof(int) == sizeof(boundaryCondition.tid));
-
-                switch(data.type) {
-                case PWGM_ELEMTYPE_BAR:{
-                    size_t start[2] = { idxQuad, 0 };
-                    size_t count[2] = { 1, 4 };
-                    
-                    // The ordering of the points for the quads made form bars
-                    // will follow the order shown below with the middle two
-                    // being the offset points.
-                    quadPoints[3] = data.index[0];
-                    quadPoints[2] = data.index[0] + tau.numPoints;
-                    quadPoints[1] = data.index[1] + tau.numPoints;
-                    quadPoints[0] = data.index[1];
-                    
-                    
-
-                    ret &= OK(nc_put_vara_int(idNc, tau.surfaceQuadId,
-                                        start, count, &(quadPoints[0])));
-
-                    size_t adjustedIdx = idxQuad + tau.bndryPanelQuadStart;
-
-                    ret = ret && OK(nc_put_var1_int(idNc,
-                            tau.numSurfBndryMarkers, &adjustedIdx,
-                            (int *)&(markerID)));
-                    idxQuad++;
-                                       }
-                default:
+static bool
+createExtrudedBndryQuads(CAEP_RTITEM &rti, PWP_UINT32 &idxQuad)
+{
+    const TAU_DATA &tau = *rti.tau;
+    bool ret = true;
+    const PWP_UINT32 numDomains = PwModDomainCount(rti.model);
+    for (PWP_UINT32 ii = 0; ii < numDomains && ret; ++ii) {
+        const PWGM_HDOMAIN hDom = PwModEnumDomains(rti.model, ii);
+        PWGM_CONDDATA condData;
+        if (!PwDomCondition(hDom, &condData)) {
+            ret = false;
+            break;
+        }
+        const PWP_UINT32 markerID = tau.nameToId.at(condData.name);
+        const PWP_UINT32 numBars = PwDomElementCount(hDom, nullptr);
+        PWGM_ELEMDATA data;
+        for (PWP_UINT32 jj = 0; jj < numBars && ret; ++jj) {
+            if (!PwElemDataMod(PwDomEnumElements(hDom, jj), &data)) {
+                ret = false;
+                break;
+            }
+            if (PWGM_ELEMTYPE_BAR == data.type) {
+                // Use the bar's end point indices and their corresponding
+                // offset indices to define an extruded side-quad. By TAU
+                // convention, the quad normal must point out of the extruded
+                // volume.
+                const size_t start[2]{ idxQuad, 0 };
+                const size_t count[2]{ 1, 4 };
+                const int indices[4]{
+                    (int)data.index[0],
+                    (int)(data.index[0] + tau.numPoints),
+                    (int)(data.index[1] + tau.numPoints),
+                    (int)data.index[1]
+                };
+                const size_t adjIdx = idxQuad + tau.extrudedQuadStart;
+                if (!OK(nc_put_vara_int(tau.idNc, tau.idQuads, start,
+                        count, indices))) {
+                    ret = false;
                     break;
                 }
-                ret = ret && !pRti->opAborted;
-                caeuProgressIncr(pRti);
+                if (!OK(nc_put_var1_int(tau.idNc, tau.numSurfBndryMarkers,
+                        &adjIdx, (int*)&markerID))) {
+                    ret = false;
+                    break;
+                }
+                ++idxQuad;
             }
-            ret = ret && !pRti->opAborted;
+            if (!caeuProgressIncr(&rti)) {
+                ret = false;
+                break;
+            }
         }
+    }
     return ret;
-}
-
-
-/****************************************************************************
- * 
- * This function simply gets the points for a particular vertex and stores them
- * in an array to be used in calculating the cross product.
- * 
- ***************************************************************************/
-static void
-getPoints(PWGM_XYZVAL coordinate[3], PWGM_HVERTEX vertex)
-{
-    PwVertXyzVal(vertex, PWGM_XYZ_X, &(coordinate[0]));
-    PwVertXyzVal(vertex, PWGM_XYZ_Y, &(coordinate[1]));
-    PwVertXyzVal(vertex, PWGM_XYZ_Z, &(coordinate[2]));
-}
-
-
-/****************************************************************************
- * 
- * This function calculates the vector based on a starting point and an end
- * point and stores it into another array to calculate the cross product and
- * determine the orientation.
- * 
- ***************************************************************************/
-static void
-createVectors(PWGM_XYZVAL vector[3], PWGM_XYZVAL startCoord[3], 
-        PWGM_XYZVAL endCoord[3])
-{
-    vector[0] = endCoord[0] - startCoord[0];
-    vector[1] = endCoord[1] - startCoord[1];
-    vector[2] = endCoord[2] - startCoord[2];
 }
 
 
@@ -934,103 +929,145 @@ createVectors(PWGM_XYZVAL vector[3], PWGM_XYZVAL startCoord[3],
  * domain.
  * 
  ***************************************************************************/
-static PWP_BOOL
-determineOrientationOfDomain(CAEP_RTITEM *pRti)
+static bool
+get2DGridOrientation(CAEP_RTITEM &rti, Orientation &orient)
 {
-    PWP_UINT32 i;
-    int orientation, message;
-    PWGM_XYZVAL coordinate0[3], coordinate1[3], coordinate2[3];
-    PWGM_XYZVAL vector1[3], vector2[3];
-    PWP_UINT32 numBlocks = PwModBlockCount(pRti->model);
-    PWGM_HVERTEX vertex;
-    PWGM_HELEMENT element;
-    PWGM_ELEMDATA data = {PWGM_ELEMTYPE_SIZE};
-    PWGM_HBLOCK block;
-    PWP_BOOL ret;
+    PWGM_ELEMDATA ed{ PWGM_ELEMTYPE_SIZE };
+    PWGM_XYZVAL coords[3][3];
 
-    // Using the first block for the direction of extrusion regardless of the
-    // orientation of the other blocks.
-    block = PwModEnumBlocks(pRti->model, 0);
-    element = PwBlkEnumElements(block, 0);
-    PwElemDataMod(element, &data);
+    auto getXYZ = [](const PWGM_HVERTEX &hVert, PWGM_XYZVAL xyz[3])
+    {
+        return PwVertXyzVal(hVert, PWGM_XYZ_X, &xyz[0]) &&
+            PwVertXyzVal(hVert, PWGM_XYZ_Y, &xyz[1]) &&
+            PwVertXyzVal(hVert, PWGM_XYZ_Z, &xyz[2]);
+    };
 
-    vertex = PwModEnumVertices(pRti->model, data.index[0]);
-    getPoints(coordinate0, vertex);
-    vertex = PwModEnumVertices(pRti->model, data.index[1]);
-    getPoints(coordinate1, vertex);
+    auto setCoords = [&rti, &getXYZ, &ed, &coords](const PWP_UINT32 blkNdx)
+    {
+        const PWGM_HELEMENT hElem = PwBlkEnumElements(
+                PwModEnumBlocks(rti.model, blkNdx), 0);
+        return PwElemDataMod(hElem, &ed) && (ed.vertCnt > 2) &&
+            getXYZ(ed.vert[0], coords[0]) && getXYZ(ed.vert[1], coords[1]) &&
+            getXYZ(ed.vert[ed.vertCnt - 1], coords[2]);
+    };
 
-    // if the element is a quad, the vertex to be used is the vertex right next
-    // to the 0th point i.e. point 3.
-    if (data.vertCnt == 4) {
-        vertex = PwModEnumVertices(pRti->model, data.index[3]);
-        getPoints(coordinate2, vertex);
-    } 
-    // if the element is a tri, the vertex to be used is the only other vertex
-    // remaining.
-    else if (data.vertCnt == 3) {
-        vertex = PwModEnumVertices(pRti->model, data.index[2]);
-        getPoints(coordinate2, vertex);
-    }
-    
-    createVectors(vector1,coordinate0,coordinate1);
-    createVectors(vector2,coordinate0,coordinate2);
-
-    // The block's orientation is determined only by the value of the z comp.
-    // This is done using the formula:
-    //   <cx, cy, cz> = < ay*bz - az*by, az*bx - ax*bz, ax*by - ay*bx >
-    // because the z component is the only required calculation, the third part
-    // of the formula is the only part being calculated.
-    orientation = (int)vector1[0] * (int)vector2[1] -
-        (int)vector1[1] * (int)vector2[0];
-    if (orientation > 0) {
-        message = 1;
-        ret = PWP_TRUE;
-    }
-    else {
-        message = 0;
-        ret = PWP_FALSE;
-    }
-    // This loop performs the same function as above but for each block. This is
-    // done to check if the user has domains oriented in a different direction
-    // as the first block. This is a problem because the file format requires
-    // that the symmetry points be input in the exact same order as the original
-    // set and different directions would create 2 pairs of points with only one
-    // associated set of original points.
-    for ( i=1 ; i < numBlocks ; i++ ) {
-        block = PwModEnumBlocks(pRti->model, i);
-        element = PwBlkEnumElements(block, 0);
-        PwElemDataMod(element, &data);
-
-        vertex = PwModEnumVertices(pRti->model, data.index[0]);
-        getPoints(coordinate0, vertex);
-        vertex = PwModEnumVertices(pRti->model, data.index[1]);
-        getPoints(coordinate1, vertex);
-
-        if (data.vertCnt == 4) {
-            vertex = PwModEnumVertices(pRti->model, data.index[3]);
-            getPoints(coordinate2, vertex);
+    auto getBlkOrientation = [&setCoords, &coords](const PWP_UINT32 blkNdx,
+        Orientation &orient)
+    {
+        const bool ret = setCoords(blkNdx);
+        if (ret) {
+            const PWGM_XYZVAL v1[3]{
+                coords[1][0] - coords[0][0],
+                coords[1][1] - coords[0][1],
+                coords[1][2] - coords[0][2]
+            };
+            const PWGM_XYZVAL v2[3]{
+                coords[2][0] - coords[0][0],
+                coords[2][1] - coords[0][1],
+                coords[2][2] - coords[0][2]
+            };
+            // THIS ASSUMES THE GRID IS CONSTRUCTED IN the XY PLANE:
+            // The orientation is determined by the the z component of
+            // (v1 cross v2).
+            // The cross product formula:
+            //   <cx, cy, cz> = < ay*bz - az*by, az*bx - ax*bz, ax*by - ay*bx >
+            const PWP_REAL crossZ = (v1[0] * v2[1]) - (v1[1] * v2[0]);
+            orient = (crossZ > 0.0) ? Orientation::Pos : Orientation::Neg;
         }
-        else if (data.vertCnt == 3) {
-            vertex = PwModEnumVertices(pRti->model, data.index[2]);
-            getPoints(coordinate2, vertex);
-        }
-        createVectors(vector1,coordinate0,coordinate1);
-        createVectors(vector2,coordinate0,coordinate2);
-        orientation = (int)vector1[0] * (int)vector2[1] -
-            (int)vector1[1] * (int)vector2[0];
-        if (orientation > 0) {
-            if (message == 0) {
-                caeuSendWarningMsg(pRti, "Domains do not have uniform "
-                    "orientation. Assuming positive orientation.", 0);
+        return ret;
+    };
+
+    // assume orient of first block is same for all blocks
+    bool ret = getBlkOrientation(0, orient);
+    if (ret) {
+        const PWP_UINT32 numBlocks = PwModBlockCount(rti.model);
+        for (PWP_UINT32 ii = 1; ii < numBlocks; ++ii) {
+            Orientation iiOrient;
+            if (!getBlkOrientation(ii, iiOrient)) {
+                ret = false;
+                break;
+            }
+            if (iiOrient != orient) {
+                // Orientation change - issue warning and stop processing
+                caeuSendWarningMsg(&rti, "Non-uniform domain orientation.", 0);
                 break;
             }
         }
-        else {
-            if (message == 1) {
-                caeuSendWarningMsg(pRti, "Domains do not have uniform "
-                    "orientation. Assuming negative orientation.", 0);
-                break;
+    }
+    return ret;
+}
+
+
+// Write out the x, y, or z coordinate values 'passes' times. The coords are
+// adjusted by 'offset * pass' (0 to passes-1).
+static bool
+writePtCoordArray(CAEP_RTITEM &rti, const PWGM_ENUM_XYZ which,
+    const PWP_UINT32 passes = 1, const PWP_REAL offset = 0.0)
+{
+    const TAU_DATA &tau = *(rti.tau);
+    bool ret = (0 != passes);
+    int cid = 0;
+    // to which coord array are we writing?
+    switch (which) {
+    case PWGM_XYZ_X:
+        cid = tau.idXc;
+        break;
+    case PWGM_XYZ_Y:
+        cid = tau.idYc;
+        break;
+    case PWGM_XYZ_Z:
+        cid = tau.idZc;
+        break;
+    default:
+        ret = false;
+    }
+    if (ret) {
+        // For speed, buffer coord values in BufSz chunks
+        constexpr size_t BufSz{ 1024 * 1024 };
+        std::unique_ptr<PWGM_XYZVAL[]> buf(new PWGM_XYZVAL[BufSz]);
+        size_t bufUsed = 0;  // number of coords in buf
+        size_t startNdx = 0; // index of first coord in buf
+        PWP_UINT32 ndx = 0;  // serialized coord index for all passes
+
+        const PWP_UINT32 NumPts = PwModVertexCount(rti.model);
+        for (PWP_UINT32 pass = 0; pass < passes; ++pass) {
+            const PWP_REAL PassOffset = offset * pass;
+            for (PWP_UINT32 ii = 0; ii < NumPts; ++ii, ++ndx) {
+                if (bufUsed < BufSz) {
+                    // buf still has room - keep going
+                }
+                else if (!OK(nc_put_vara_double(tau.idNc, cid, &startNdx,
+                        &BufSz, buf.get()))) {
+                    // could not flush buf to file
+                    ret = false;
+                    break;
+                }
+                else {
+                    // buf was flushed to file
+                    bufUsed = 0;
+                    startNdx = ndx;
+                }
+
+                // Append coord to buffer
+                const PWGM_HVERTEX vertex = PwModEnumVertices(rti.model, ii);
+                if (PwVertXyzVal(vertex, which, &buf[bufUsed])) {
+                    buf[bufUsed++] += PassOffset;
+                }
+                else {
+                    ret = false;
+                    break;
+                }
+
+                if (!caeuProgressIncr(&rti)) {
+                    ret = false;
+                    break;
+                }
             }
+        }
+        if (ret && (0 != bufUsed)) {
+            // flush partial buffer
+            ret = OK(nc_put_vara_double(tau.idNc, cid, &startNdx, &bufUsed,
+                buf.get()));
         }
     }
     return ret;
@@ -1043,81 +1080,15 @@ determineOrientationOfDomain(CAEP_RTITEM *pRti)
  * respective TAU variables.
  * 
  ***************************************************************************/
-static PWP_BOOL
-writePointVars(CAEP_RTITEM *pRti)
+static bool
+writePointVars3D(CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
-    int idNc = tau.idNc;
-
-    int xcid = tau.idXc;
-    int ycid = tau.idYc;
-    int zcid = tau.idZc;
-
-    // assert to make sure the value retrieved in PwVertXyzVal and that
-    // saved by nc_put_var1_double are compatible.
-    assert(sizeof(PWGM_XYZVAL) == sizeof(double));
-
-    PWP_UINT32 numPoints = PwModVertexCount(pRti->model);
-    if (caeuProgressBeginStep(pRti, 3 * numPoints)) {
-        // originally the xs, ys, and zs were saved in the same loop, however
-        // that created a speed bottleneck; putting xs ys and zs in separate
-        // loops at least triples performance
-
-        // val is a buffer to save points in so that they can be written out
-        // faster.
-        PWGM_XYZVAL val[64];
-        for (PWP_UINT32 i = 0; i < numPoints && ret; ++i) {
-            // retrieve vertex
-            PWGM_HVERTEX vertex = PwModEnumVertices(pRti->model, i);
-
-            // retrieve x val from vertex
-            ret = ret && PwVertXyzVal(vertex, PWGM_XYZ_X, &(val[i % 64]));
-
-            // if at end of buffer or at last point, clear buffer to memory
-            if (i % 64 == 63 || i == numPoints - 1) {
-                // save vertex to associated variable
-                size_t index[1] = {i / 64 * 64};
-                size_t count[1] = {i % 64 + 1};
-                ret = ret && OK(nc_put_vara_double(idNc, xcid, index, count,
-                    &(val[0])));
-            }
-            ret = ret && !pRti->opAborted;
-            caeuProgressIncr(pRti);
-        }
-        for (PWP_UINT32 i = 0; i < numPoints && ret; ++i) {
-            PWGM_HVERTEX vertex = PwModEnumVertices(pRti->model, i);
-
-            ret = ret && PwVertXyzVal(vertex, PWGM_XYZ_Y, &(val[i % 64]));
-
-            // if at end of buffer or at last point, clear buffer to memory
-            if (i % 64 == 63 || i == numPoints - 1) {
-                size_t index[1] = {i / 64 * 64};
-                size_t count[1] = {i % 64 + 1};
-                ret = ret && OK(nc_put_vara_double(idNc, ycid, index, count,
-                    &(val[0])));
-            }
-            ret = ret && !pRti->opAborted;
-            caeuProgressIncr(pRti);
-        }
-        for (PWP_UINT32 i = 0; i < numPoints && ret; ++i) {
-            PWGM_HVERTEX vertex = PwModEnumVertices(pRti->model, i);
-
-            ret = ret && PwVertXyzVal(vertex, PWGM_XYZ_Z, &(val[i % 64]));
-
-            // if at end of buffer or at last point, clear buffer to memory
-            if (i % 64 == 63 || i == numPoints - 1) {
-                size_t index[1] = {i / 64 * 64};
-                size_t count[1] = {i % 64 + 1};
-                ret = ret && OK(nc_put_vara_double(idNc, zcid, index, count,
-                    &(val[0])));
-            }
-            ret = ret && !pRti->opAborted;
-            caeuProgressIncr(pRti);
-        }
-        caeuProgressEndStep(pRti);
-    }
-    return ret;
+    const PWP_UINT32 NumPoints = PwModVertexCount(rti.model);
+    const bool ret = caeuProgressBeginStep(&rti, 3 * NumPoints) &&
+        writePtCoordArray(rti, PWGM_XYZ_X) &&
+        writePtCoordArray(rti, PWGM_XYZ_Y) &&
+        writePtCoordArray(rti, PWGM_XYZ_Z);
+    return caeuProgressEndStep(&rti) && ret;
 }
 
 
@@ -1128,158 +1099,23 @@ writePointVars(CAEP_RTITEM *pRti)
  * repeated, offsetting the z component by the amount defined by the user.
  * 
  ***************************************************************************/
-static PWP_BOOL
-writePointVars2D(CAEP_RTITEM *pRti)
+static bool
+writePointVars2D(CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
-    PWP_BOOL direction = determineOrientationOfDomain(pRti);
-    PWP_UINT32 i;
-    int idNc = tau.idNc;
+    const PWP_UINT32 NumPoints = PwModVertexCount(rti.model);
+    const PWP_UINT32 Passes{ 2 };
+    Orientation dir;
     PWP_REAL thickness;
-    PwModGetAttributeREAL(pRti->model, Thickness, &thickness);
-    int xcid = tau.idXc;
-    int ycid = tau.idYc;
-    int zcid = tau.idZc;
-
-    // assert to make sure the value retrieved in PwVertXyzVal and that
-    // saved by nc_put_var1_double are compatible.
-    assert(sizeof(PWGM_XYZVAL) == sizeof(double));
-
-    PWP_UINT32 numPoints = PwModVertexCount(pRti->model);
-    if (caeuProgressBeginStep(pRti, 3 * numPoints)) {
-        // originally the xs, ys, and zs were saved in the same loop, however
-        // that created a speed bottleneck; putting xs ys and zs in separate
-        // loops at least triples performance
-
-        // val is a buffer to save points in so that they can be written out
-        // faster.
-        PWGM_XYZVAL val[64];
-        PWGM_HVERTEX vertex;
-        for (i = 0; i < numPoints && ret; ++i) {
-            // retrieve vertex
-            vertex = PwModEnumVertices(pRti->model, i);
-
-            // retrieve x val from vertex
-            ret = ret && PwVertXyzVal(vertex, PWGM_XYZ_X, &(val[i % 64]));
-
-            // if at end of buffer or at last point, clear buffer to memory
-            if (i % 64 == 63 || i == numPoints - 1) {
-                // save vertex to associated variable
-                size_t index[1] = {i / 64 * 64};
-                size_t count[1] = {i % 64 + 1};
-                ret = ret && OK(nc_put_vara_double(idNc, xcid, index, count,
-                    &(val[0])));
-            }
-            ret = ret && !pRti->opAborted;
-            caeuProgressIncr(pRti);
-        }
-        for (i = 0; i < numPoints && ret; ++i) {
-            vertex = PwModEnumVertices(pRti->model, i);
-
-            ret = ret && PwVertXyzVal(vertex, PWGM_XYZ_Y, &(val[i % 64]));
-
-            // if at end of buffer or at last point, clear buffer to memory
-            if (i % 64 == 63 || i == numPoints - 1) {
-                size_t index[1] = {i / 64 * 64};
-                size_t count[1] = {i % 64 + 1};
-                ret = ret && OK(nc_put_vara_double(idNc, ycid, index, count,
-                    &(val[0])));
-            }
-            ret = ret && !pRti->opAborted;
-            caeuProgressIncr(pRti);
-        }
-        for (i = 0; i < numPoints && ret; ++i) {
-            vertex = PwModEnumVertices(pRti->model, i);
-
-            ret = ret && PwVertXyzVal(vertex, PWGM_XYZ_Z, &(val[i % 64]));
-
-            // if at end of buffer or at last point, clear buffer to memory
-            if (i % 64 == 63 || i == numPoints - 1) {
-                size_t index[1] = {i / 64 * 64};
-                size_t count[1] = {i % 64 + 1};
-                ret = ret && OK(nc_put_vara_double(idNc, zcid, index, count,
-                    &(val[0])));
-            }
-            ret = ret && !pRti->opAborted;
-            caeuProgressIncr(pRti);
-        }
-        // This is for the second set of points that are defined as part of
-        // the TAU 2D export. They are duplicates of the original points but
-        // will have a z offset.
-        for (i = 0; i < numPoints && ret; ++i) {
-            // retrieve vertex
-            vertex = PwModEnumVertices(pRti->model, i);
-
-            // retrieve x val from vertex
-            ret = ret && PwVertXyzVal(vertex, PWGM_XYZ_X, &(val[i % 64]));
-
-            // if at end of buffer or at last point, clear buffer to memory
-            if (i % 64 == 63 || i == numPoints - 1) {
-                // save vertex to associated variable
-                //Adding the numPoints will offset the new point to be the same
-                //
-                size_t index[1] = {(i / 64 * 64) + numPoints};
-                size_t count[1] = {i % 64 + 1};
-                ret = ret && OK(nc_put_vara_double(idNc, xcid, index, count,
-                    &(val[0])));
-            }
-            ret = ret && !pRti->opAborted;
-            caeuProgressIncr(pRti);
-        }
-        for (i = 0; i < numPoints && ret; ++i) {
-            vertex = PwModEnumVertices(pRti->model, i);
-
-            ret = ret && PwVertXyzVal(vertex, PWGM_XYZ_Y, &(val[i % 64]));
-
-            // if at end of buffer or at last point, clear buffer to memory
-            if (i % 64 == 63 || i == numPoints - 1) {
-                size_t index[1] = {(i / 64 * 64) + numPoints};
-                size_t count[1] = {i % 64 + 1};
-                ret = ret && OK(nc_put_vara_double(idNc, ycid, index, count,
-                    &(val[0])));
-            }
-            ret = ret && !pRti->opAborted;
-            caeuProgressIncr(pRti);
-        }
-        for (i = 0; i < numPoints && ret; ++i) {
-            vertex = PwModEnumVertices(pRti->model, i);
-
-            ret = ret && PwVertXyzVal(vertex, PWGM_XYZ_Z, &(val[i % 64]));
-            
-            // The value of 1 is the assumed step size of the extrusion for 2D.
-            if (direction) {
-                val[i % 64] += thickness;
-            }
-            // Or, the value will have a negative offset if the user has their
-            // domains orientated in the negative z direction.
-            else {
-                val[i % 64] -= thickness;
-            }
-
-            // if at end of buffer or at last point, clear buffer to memory
-            if (i % 64 == 63 || i == numPoints - 1) {
-                size_t index[1] = {(i / 64 * 64) + numPoints};
-                size_t count[1] = {i % 64 + 1};
-                ret = ret && OK(nc_put_vara_double(idNc, zcid, index, count,
-                    &(val[0])));
-            }
-            ret = ret && !pRti->opAborted;
-            caeuProgressIncr(pRti);
-        }
-        caeuProgressEndStep(pRti);
-    }
-    return ret;
+    const bool ret = caeuProgressBeginStep(&rti, 3 * NumPoints) &&
+        get2DGridOrientation(rti, dir) &&
+        PwModGetAttributeREAL(rti.model, Thickness, &thickness) &&
+        writePtCoordArray(rti, PWGM_XYZ_X, Passes) &&
+        writePtCoordArray(rti, PWGM_XYZ_Y, Passes) &&
+        writePtCoordArray(rti, PWGM_XYZ_Z, Passes, thickness *
+            static_cast<PWP_REAL>(dir));
+    return caeuProgressEndStep(&rti) && ret;
 }
 
-// These four numbers give the buffer sizes for each shape type. They are used
-// only by the writeElementVars() function. Shapes are buffered together,
-// because they get saved to different parts of the file, and caching them
-// reduces runtime (runtimeWrite() function takes 20% less time with buffering)
-#define BUFFER_SIZE_TET 64
-#define BUFFER_SIZE_PYR 64
-#define BUFFER_SIZE_WEDGE 64
-#define BUFFER_SIZE_HEX 64
 
 /****************************************************************************
  * 
@@ -1288,163 +1124,62 @@ writePointVars2D(CAEP_RTITEM *pRti)
  * based on their element-type.
  * 
  ***************************************************************************/
-static PWP_BOOL
-writeElementVars(CAEP_RTITEM *pRti)
+static bool
+writeElementVars(CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
-    int idNc = tau.idNc;
-
-    // because the different element types are saved in different arrays, we
-    // must track and increment separate indexes for each element type in order
-    // to know where the next element needs to be saved.
-    
-    PWP_UINT32 idxTet = 0;
-    PWP_UINT32 idxPyr = 0;
-    PWP_UINT32 idxWedge = 0;
-    PWP_UINT32 idxHex = 0;
-
-    // caches; See comment above '#define BUFFER_SIZE_TET 64'
-    int bufferedTets[BUFFER_SIZE_TET][4];
-    int bufferedPyramids[BUFFER_SIZE_PYR][5];
-    int bufferedWedges[BUFFER_SIZE_WEDGE][6];
-    int bufferedHexes[BUFFER_SIZE_HEX][8];
-
-    PWP_UINT32 numTets = (PWP_UINT32)tau.numTets;
-    PWP_UINT32 numPyrs = (PWP_UINT32)tau.numPyramids;
-    PWP_UINT32 numWedges = (PWP_UINT32)tau.numWedges;
-    PWP_UINT32 numHexes = (PWP_UINT32)tau.numHexes;
-
-    // now we iterate through the blocks, and through each block's block-
-    // elements, and output the results to the netcdf file.
-
-    PWP_UINT32 numBlocks = PwModBlockCount(pRti->model);
-    if (caeuProgressBeginStep(pRti, tau.numElements)) {
-
-        // Init data to invalid value
-        PWGM_ELEMDATA data = {PWGM_ELEMTYPE_SIZE};
-
+    TAU_DATA &tau = *(rti.tau);
+    bool ret = true;
+    if (caeuProgressBeginStep(&rti, tau.numElements)) {
+        // Cache up to 512K cells per buffer
+        ElemBuffer<4, 512 * 1024> tetBuf(tau.idNc, tau.idTets);
+        ElemBuffer<5, 512 * 1024> pyrBuf(tau.idNc, tau.idPyramids);
+        ElemBuffer<6, 512 * 1024> priBuf(tau.idNc, tau.idPrisms);
+        ElemBuffer<8, 512 * 1024> hexBuf(tau.idNc, tau.idHexes);
+        PWGM_ELEMDATA data;
+        const PWP_UINT32 numBlocks = PwModBlockCount(rti.model);
         for (PWP_UINT32 i = 0; i < numBlocks && ret; ++i) {
-            PWGM_HBLOCK block = PwModEnumBlocks(pRti->model, i);
-            PWP_UINT32 numElements = PwBlkElementCount(block, 0);
+            const PWGM_HBLOCK hBlk = PwModEnumBlocks(rti.model, i);
+            const PWP_UINT32 numElements = PwBlkElementCount(hBlk, 0);
             for (PWP_UINT32 j = 0; j < numElements && ret; ++j) {
-                PWGM_HELEMENT element = PwBlkEnumElements(block, j);
-
-                ret = PwElemDataMod(element, &data);
-
-                // assert to make sure int and data.index[0] are compatible for 
-                // calls to nc_put_vara_int
-                assert(sizeof(int) == sizeof(data.index[0]));
-
-                // now we enter a switch on the type of the element to
-                // determine where and how to save it.
-
-                // note that (thankfully) the indexing scheme for EVERY element
-                // type is the same for TAU and CAE, so they don't need to be
-                // re-indexed.
-
-                // all cases in the switch are handled in the same manner
-
+                const PWGM_HELEMENT element = PwBlkEnumElements(hBlk, j);
+                if (!PwElemDataMod(element, &data)) {
+                    ret = false;
+                    break;
+                }
+                // note that the indexing scheme for EVERY element type is the
+                // same for TAU and CAE, so they don't need to be re-indexed.
                 switch(data.type) {
                 case PWGM_ELEMTYPE_TET:
-                    // copy data to cache
-                    for (int k = 0; k < 4; ++k) {
-                        bufferedTets[idxTet % BUFFER_SIZE_TET][k] =
-                                (int)data.index[k];
-                    }
-                    idxTet++;
-                    // If cache is full, OR we reach the last of this kind of
-                    // element, then clear the cache
-                    if (0u == idxTet % BUFFER_SIZE_TET || idxTet == numTets) {
-                        size_t start[2] = {(idxTet - 1) /BUFFER_SIZE_TET *
-                            BUFFER_SIZE_TET, 0};
-                        size_t count[2] = {BUFFER_SIZE_TET, 4};
-                        // Treat the last buffered group differently (because
-                        // it may not use the whole buffer). Note that when
-                        // (numTets % BUFFER_SIZE_TET == 0) the if block is not
-                        // entered, because that means the whole buffer is
-                        // being used (and we don't want to set count[0] to 0).
-                        if (idxTet == numTets && numTets %
-                                BUFFER_SIZE_TET != 0) {
-                            count[0] = numTets % BUFFER_SIZE_TET;
-                        }
-                        // perform the write and handle errors
-                        ret = ret && OK(nc_put_vara_int(idNc, tau.idTets, start,
-                            count, &(bufferedTets[0][0])));
-                    }
+                    tetBuf.add(data);
                     break;
                 case PWGM_ELEMTYPE_PYRAMID:
-                    // see comments in PWGM_ELEMTYPE_TET case
-                    for (int k = 0; k < 5; ++k) {
-                        bufferedPyramids[idxPyr % BUFFER_SIZE_PYR][k] =
-                            (int)data.index[k];
-                    }
-                    idxPyr++;
-                    if (0u == idxPyr % BUFFER_SIZE_PYR || idxPyr == numPyrs) {
-                        size_t start[2] = {(idxPyr - 1) / BUFFER_SIZE_PYR *
-                            BUFFER_SIZE_PYR, 0};
-                        size_t count[2] = {BUFFER_SIZE_PYR, 5};
-                        if (idxPyr == numPyrs &&
-                                numPyrs % BUFFER_SIZE_PYR != 0) {
-                            count[0] = numPyrs % BUFFER_SIZE_PYR;
-                        }
-                        ret = ret && OK(nc_put_vara_int(idNc, tau.idPyramids,
-                            start, count, &(bufferedPyramids[0][0])));
-                    }
+                    pyrBuf.add(data);
                     break;
                 case PWGM_ELEMTYPE_WEDGE:
-                    // see comments in PWGM_ELEMTYPE_TET case
-                    for (int k = 0; k < 6; ++k) {
-                        bufferedWedges[idxWedge % BUFFER_SIZE_WEDGE][k] =
-                                (int)data.index[k];
-                    }
-                    idxWedge++;
-                    if (0u == idxWedge % BUFFER_SIZE_WEDGE || idxWedge ==
-                            numWedges) {
-                        size_t start[2] = {(idxWedge - 1) / BUFFER_SIZE_WEDGE *
-                            BUFFER_SIZE_WEDGE, 0};
-                        size_t count[2] = {BUFFER_SIZE_WEDGE, 6};
-                        if (idxWedge == numWedges && numWedges %
-                                BUFFER_SIZE_WEDGE != 0) {
-                            count[0] = numWedges % BUFFER_SIZE_WEDGE;
-                        }
-                        ret = ret && OK(nc_put_vara_int(idNc, tau.idPrisms,
-                            start, count, &(bufferedWedges[0][0])));
-                    }
+                    priBuf.add(data);
                     break;
-                case PWGM_ELEMTYPE_HEX:
-                    // see comments in PWGM_ELEMTYPE_TET case
-                    for (int k = 0; k < 8; ++k) {
-                        bufferedHexes[idxHex % BUFFER_SIZE_HEX][k] =
-                                (int)data.index[k];
-                    }
-                    idxHex++;
-                    if (0u == idxHex % BUFFER_SIZE_HEX || idxHex == numHexes) {
-                        size_t start[2] = {(idxHex - 1) / BUFFER_SIZE_HEX *
-                            BUFFER_SIZE_HEX, 0};
-                        size_t count[2] = {BUFFER_SIZE_HEX, 8};
-                        if (idxHex == numHexes && numHexes %
-                                BUFFER_SIZE_HEX != 0) {
-                            count[0] = numHexes % BUFFER_SIZE_HEX;
-                        }
-                        ret = ret && OK(nc_put_vara_int(idNc, tau.idHexes,
-                            start, count, &(bufferedHexes[0][0])));
-                    }
-                    break;
+                case PWGM_ELEMTYPE_HEX: {
+                    hexBuf.add(data);
+                    break; }
                 default:
                     // this should not occur; somehow an unsupported type was
                     // given.
                     ret = false;
                     break;
                 }
-                ret = ret && !pRti->opAborted;
-                caeuProgressIncr(pRti);
+                if (!caeuProgressIncr(&rti)) {
+                    ret = false;
+                    break;
+                }
             }
         }
-        caeuProgressEndStep(pRti);
+        if (ret) {
+            // No errors so far - capture final flush() status
+            ret = tetBuf.flush() && pyrBuf.flush() && priBuf.flush() &&
+                hexBuf.flush();
+        }
     }
-
-    return ret;
+    return caeuProgressEndStep(&rti) && ret;
 }
 
 
@@ -1456,128 +1191,108 @@ writeElementVars(CAEP_RTITEM *pRti)
  * element.
  * 
  ***************************************************************************/
-static PWP_BOOL
-writeElementVars2D(CAEP_RTITEM *pRti)
+static bool
+writeElementVars2D(CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
-    int idNc = tau.idNc;
-
-    // as with block-elements, we must separately track our indexing into the
-    // tri and quad netcdf-variables.
-
-    PWP_UINT32 idxTri = 0;
-    PWP_UINT32 idxQuad = 0;
+    TAU_DATA &tau = *(rti.tau);
+    bool ret = true;
+    // separately track our indexing into the tri and quad netcdf-variables.
     tau.indexHex = 0;
-    tau.indexWedge = 0;
-
-    // now we iterate through the domains, and through each domain's domain-
-    // elements, and output the results to the netcdf file.
-
-    PWP_UINT32 numBlocks = PwModBlockCount(pRti->model);
-    PWGM_ELEMDATA data = {PWGM_ELEMTYPE_BAR};
-
-    if (caeuProgressBeginStep(pRti, tau.numSurfaceElements-tau.numBars)) {
-
+    tau.indexPrism = 0;
+    // iterate through each 2D block's elements
+    PWP_UINT32 idxQuad = 0;
+    const PWP_UINT32 numBlocks = PwModBlockCount(rti.model);
+    if (caeuProgressBeginStep(&rti, tau.numSurfaceElements - tau.numBars)) {
+        const int idNc = tau.idNc;
+        PWP_UINT32 idxTri = 0;
+        PWGM_ELEMDATA data;
         // This initializes the variable with a dummy variable which will
         // later be changed. In 3D a domain can not have a bar element.
-        
         for (PWP_UINT32 i = 0; i < numBlocks && ret; ++i) {
-
-            PWGM_HBLOCK block = PwModEnumBlocks(pRti->model, i);
-            
-            PWP_UINT32 markerID =
-                    tau.mapNameToOutputID["Symmetry_1"];
-            PWP_UINT32 numSurfaceElements = PwBlkElementCount(block, 0);
-
+            const PWGM_HBLOCK hBlk = PwModEnumBlocks(rti.model, i);
+            const PWP_UINT32 markerID = tau.nameToId["Symmetry_1"];
+            const PWP_UINT32 numSurfaceElements = PwBlkElementCount(hBlk, 0);
             for (PWP_UINT32 j = 0; j < numSurfaceElements && ret; ++j) {
-                PWGM_HELEMENT surfaceElement = PwBlkEnumElements(block, j);
-
-                ret = ret && PwElemDataMod(surfaceElement, &data);
-
-                // assert to make sure int and data.index[0] are compatible for 
-                // calls to nc_put_vara_int (on surface-element information)
-                assert(sizeof(int) == sizeof(data.index[0]));
-
-                // assert to make sure int and PWP_UINT are compatible for 
-                // calls to nc_put_var1_int (on boundarypanel information)
-                assert(sizeof(int) == sizeof(PWP_UINT32));
-
+                if (!PwElemDataMod(PwBlkEnumElements(hBlk, j), &data)) {
+                    ret = false;
+                    break;
+                }
                 switch(data.type) {
-                
                 case PWGM_ELEMTYPE_TRI: {
-                    // save vertex information for current triangle
-                    size_t start[2] = { idxTri, 0 };
-                    size_t count[2] = { 1, 3 };
-                    // unfortunately the point order of surface triangles in
-                    // TAU is reversed of the order in Pointwise. The reversal
-                    // also must occur for surface quadrilaterals.
-                    int triPoints[3] = { (int)data.index[2], (int)data.index[1],
-                        (int)data.index[0] };
-                    ret = ret && OK(nc_put_vara_int(idNc, tau.surfaceTriId,
-                        start, count, &(triPoints[0])));
-
-                    size_t adjustedIdx = idxTri + tau.bndryPanelTriStart;
-
-                    // save marker (Pointwise boundary-condition) information
-                    ret = ret && OK(nc_put_var1_int(idNc,
-                        tau.numSurfBndryMarkers, &adjustedIdx,
-                        (int *)&(markerID)));
-
-                    // increment to next triangle
-                    idxTri++;
+                    // the point order of TAU triangles is the reverse of PW
+                    const size_t start[2] = { idxTri, 0 };
+                    const size_t count[2] = { 1, 3 };
+                    const int indices[3] = {
+                        (int)data.index[2],
+                        (int)data.index[1],
+                        (int)data.index[0]
+                    };
+                    if (!OK(nc_put_vara_int(idNc, tau.idTris, start,
+                            count, indices))) {
+                        ret = false;
+                        break;
+                    }
+                    const size_t adjIdx = idxTri + tau.extrudedTriStart;
+                    if (!OK(nc_put_var1_int(idNc, tau.numSurfBndryMarkers,
+                            &adjIdx, (int*)&markerID))) {
+                        ret = false;
+                        break;
+                    }
+                    ++idxTri;
                     // Create the new triangle element that is extruded from
                     // this element.
-                    ret = ret && createTriElement(idxTri,data,idNc,pRti);
-                    // increment to next triangle
-                    idxTri++;
-                    // increment to next wedge
-                    tau.indexWedge++;
+                    if (!createExtrudedTriTopElement(rti, idxTri, data)) {
+                        ret = false;
+                        break;
+                    }
+                    ++idxTri;
+                    ++tau.indexPrism;
                     break; }
                 case PWGM_ELEMTYPE_QUAD: {
                     // see comments for PWGM_ELEMTYPE_TRI:
-                    size_t start[2] = { idxQuad, 0 };
-                    size_t count[2] = { 1, 4 };
-                    int quadPoints[4] = { (int)data.index[3],
-                        (int)data.index[2], (int)data.index[1],
-                        (int)data.index[0] };
-                    ret = ret && OK(nc_put_vara_int(idNc, tau.surfaceQuadId,
-                        start, count, &(quadPoints[0])));
-
-                    size_t adjustedIdx = idxQuad + tau.bndryPanelQuadStart;
-
-                    ret = ret && OK(nc_put_var1_int(idNc,
-                        tau.numSurfBndryMarkers, &adjustedIdx,
-                        (int *)&(markerID)));
-                    
-                    // increment to next quad
-                    idxQuad++;
-                    // Create the new quad element that is offset from this
-                    // element.
-                    ret = ret && createQuadElement(idxQuad,data,idNc,pRti);
-                    // increment to next quad
-                    idxQuad++;
-                    // increment to next hex
-                    tau.indexHex++;
+                    const size_t start[2] = { idxQuad, 0 };
+                    const size_t count[2] = { 1, 4 };
+                    const int indices[4] = {
+                        (int)data.index[3],
+                        (int)data.index[2],
+                        (int)data.index[1],
+                        (int)data.index[0]
+                    };
+                    if (!OK(nc_put_vara_int(idNc, tau.idQuads, start,
+                            count, indices))) {
+                        ret = false;
+                        break;
+                    }
+                    const size_t adjIdx = idxQuad + tau.extrudedQuadStart;
+                    if (!OK(nc_put_var1_int(idNc, tau.numSurfBndryMarkers,
+                            &adjIdx, (int*)&markerID))) {
+                        ret = false;
+                        break;
+                    }
+                    ++idxQuad;
+                    if (!createExtrudedQuadTopElement(rti, idxQuad, data)) {
+                        ret = false;
+                        break;
+                    }
+                    ++idxQuad;
+                    ++tau.indexHex;
                     break; }
                 default:
                     break;
                 }
-                ret = ret && !pRti->opAborted;
-                caeuProgressIncr(pRti);
-                caeuProgressIncr(pRti);
+                if (!caeuProgressIncr(&rti)) {
+                    ret = false;
+                    break;
+                }
             }
-            ret = ret && !pRti->opAborted;
         }
-        caeuProgressEndStep(pRti);
+        caeuProgressEndStep(&rti);
     }
 
     // After all of the quads and tris are written, the bars need to be extruded
     // and written to the quad variable. This requires continuing to track the
     // index of the quad.
-    ret &= writeQuadElementFromBar(idxQuad, idNc, pRti);
-
-    return ret;
+    return ret && createExtrudedBndryQuads(rti, idxQuad);
 }
 
 
@@ -1587,15 +1302,17 @@ writeElementVars2D(CAEP_RTITEM *pRti)
  * have assured that each value is the same as its index.
  * 
  ***************************************************************************/
-static PWP_BOOL
-writeMarkers(CAEP_RTITEM *pRti)
+static bool
+writeMarkers(const CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
-    int idNc = tau.idNc;
-    for (int ii = 0; ii < (int)tau.mapNameToOutputID.size() && ret; ++ii) {
-        size_t index[1] = {(size_t)ii};
-        ret = ret && OK(nc_put_var1_int(idNc, tau.markerId, index, &ii));
+    const TAU_DATA &tau = *(rti.tau);
+    bool ret = true;
+    for (size_t index = 0; index < tau.nameToId.size(); ++index) {
+        const int op = (int)index;
+        if (!OK(nc_put_var1_int(tau.idNc, tau.idMarker, &index, &op))) {
+            ret = false;
+            break;
+        }
     }
     return ret;
 }
@@ -1607,108 +1324,96 @@ writeMarkers(CAEP_RTITEM *pRti)
  * respective TAU variables, based on their element-type.
  * 
  ***************************************************************************/
-static PWP_BOOL
-writeSurfaceElementVars(CAEP_RTITEM *pRti)
+static bool
+writeSurfaceElementVars(CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
-    int idNc = tau.idNc;
-
-    // as with block-elements, we must separately track our indexing into the
-    // tri and quad netcdf-variables.
-
-    PWP_UINT32 idxTri = 0;
-    PWP_UINT32 idxQuad = 0;
-
-    // now we iterate through the domains, and through each domain's domain-
-    // elements, and output the results to the netcdf file.
-
-    PWP_UINT32 numDomains = PwModDomainCount(pRti->model);
-    if (caeuProgressBeginStep(pRti, tau.numSurfaceElements)) {
-
-        // This initializes the variable with a dummy variable which will
-        // later be changed. In 3D a domain can not have a bar element.
-        PWGM_ELEMDATA data = {PWGM_ELEMTYPE_BAR};
-        for (PWP_UINT32 i = 0; i < numDomains && ret; ++i) {
-            PWGM_HDOMAIN domain = PwModEnumDomains(pRti->model, i);
-            PWGM_CONDDATA boundaryCondition = {""};
-            ret = ret && PwDomCondition(domain, &boundaryCondition);
-            PWP_UINT32 markerID =
-                    tau.mapNameToOutputID[boundaryCondition.name];
-            PWP_UINT32 numSurfaceElements = PwDomElementCount(domain, 0);
-            for (PWP_UINT32 j = 0; j < numSurfaceElements && ret; ++j) {
-                PWGM_HELEMENT surfaceElement = PwDomEnumElements(domain, j);
-
-                ret = ret && PwElemDataMod(surfaceElement, &data);
-
-                // assert to make sure int and data.index[0] are compatible for 
-                // calls to nc_put_vara_int (on surface-element information)
-                assert(sizeof(int) == sizeof(data.index[0]));
-
-                // assert to make sure int and PWP_UINT are compatible for 
-                // calls to nc_put_var1_int (on boundarypanel information)
-                assert(sizeof(int) == sizeof(PWP_UINT32));
-
-                // assert to make sure int and tid are compatible for 
-                // calls to nc_put_var1_int (on marker array)
-                assert(sizeof(int) == sizeof(boundaryCondition.tid));
-
+    const TAU_DATA &tau = *(rti.tau);
+    // iterate through the domain elements and output to the file
+    bool ret = (0 != caeuProgressBeginStep(&rti, tau.numSurfaceElements));
+    if (ret) {
+        // separately track indexing into the tri and quad netcdf-variables
+        PWP_UINT32 idxTri = 0;
+        PWP_UINT32 idxQuad = 0;
+        const PWP_UINT32 numDoms = PwModDomainCount(rti.model);
+        for (PWP_UINT32 ii = 0; ii < numDoms && ret; ++ii) {
+            PWGM_CONDDATA condData{ "" };
+            const PWGM_HDOMAIN hDom = PwModEnumDomains(rti.model, ii);
+            if (!PwDomCondition(hDom, &condData)) {
+                ret = false;
+                break;
+            }
+            const PWP_UINT32 markerID = tau.nameToId.at(condData.name);
+            const PWP_UINT32 numSurfElems = PwDomElementCount(hDom, 0);
+            PWGM_ELEMDATA data;
+            for (PWP_UINT32 jj = 0; jj < numSurfElems && ret; ++jj) {
+                if (!PwElemDataMod(PwDomEnumElements(hDom, jj), &data)) {
+                    ret = false;
+                    break;
+                }
                 switch(data.type) {
                 case PWGM_ELEMTYPE_TRI: {
                     // save vertex information for current triangle
-                    size_t start[2] = { idxTri, 0 };
-                    size_t count[2] = { 1, 3 };
+                    const size_t start[2]{ idxTri, 0 };
+                    const size_t count[2]{ 1, 3 };
                     // unfortunately the point order of surface triangles in
                     // TAU is reversed of the order in Pointwise. The reversal
                     // also must occur for surface quadrilaterals.
-                    int triPoints[3] = { (int)data.index[2], (int)data.index[1],
-                        (int)data.index[0] };
-                    ret = ret && OK(nc_put_vara_int(idNc, tau.surfaceTriId,
-                        start, count, &(triPoints[0])));
-
+                    const int indices[3] = {
+                        (int)data.index[2],
+                        (int)data.index[1],
+                        (int)data.index[0]
+                    };
+                    if (!OK(nc_put_vara_int(tau.idNc, tau.idTris, start,
+                            count, indices))) {
+                        ret = false;
+                        break;
+                    }
                     // compute the index into the boundarypanel variable and
                     // the marker variable, based on the offset for 
                     // triangles and the index of the current triangle
-                    size_t adjustedIdx = idxTri + tau.bndryPanelTriStart;
-
+                    const size_t adjIdx = idxTri + tau.extrudedTriStart;
                     // save marker (Pointwise boundary-condition) information
-                    ret = ret && OK(nc_put_var1_int(idNc,
-                        tau.numSurfBndryMarkers, &adjustedIdx,
-                        (int *)&(markerID)));
-
-                    // increment to next triangle
-                    idxTri++;
+                    if (!OK(nc_put_var1_int(tau.idNc, tau.numSurfBndryMarkers,
+                            &adjIdx, (int*)&markerID))) {
+                        ret = false;
+                        break;
+                    }
+                    ++idxTri;
                     break; }
                 case PWGM_ELEMTYPE_QUAD: {
                     // see comments for PWGM_ELEMTYPE_TRI:
-                    size_t start[2] = { idxQuad, 0 };
-                    size_t count[2] = { 1, 4 };
-                    int quadPoints[4] = { (int)data.index[3],
-                        (int)data.index[2], (int)data.index[1],
-                        (int)data.index[0] };
-                    ret = ret && OK(nc_put_vara_int(idNc, tau.surfaceQuadId,
-                        start, count, &(quadPoints[0])));
-
-                    size_t adjustedIdx = idxQuad + tau.bndryPanelQuadStart;
-
-                    ret = ret && OK(nc_put_var1_int(idNc,
-                        tau.numSurfBndryMarkers, &adjustedIdx,
-                        (int *)&(markerID)));
-
-                    idxQuad++;
+                    const size_t start[2]{ idxQuad, 0 };
+                    const size_t count[2]{ 1, 4 };
+                    const int indices[4] = {
+                        (int)data.index[3],
+                        (int)data.index[2],
+                        (int)data.index[1],
+                        (int)data.index[0]
+                    };
+                    if (!OK(nc_put_vara_int(tau.idNc, tau.idQuads, start,
+                            count, indices))) {
+                        ret = false;
+                        break;
+                    }
+                    const size_t adjIdx = idxQuad + tau.extrudedQuadStart;
+                    if (!OK(nc_put_var1_int(tau.idNc, tau.numSurfBndryMarkers,
+                            &adjIdx, (int*)&markerID))) {
+                        ret = false;
+                        break;
+                    }
+                    ++idxQuad;
                     break; }
                 default:// probably a bar
                     break;
                 }
-                ret = ret && !pRti->opAborted;
-                caeuProgressIncr(pRti);
+                if (!caeuProgressIncr(&rti)) {
+                    ret = false;
+                    break;
+                }
             }
-            ret = ret && !pRti->opAborted;
         }
-        caeuProgressEndStep(pRti);
     }
-
-    return ret;
+    return caeuProgressEndStep(&rti) && ret;
 }
 
 
@@ -1718,10 +1423,10 @@ writeSurfaceElementVars(CAEP_RTITEM *pRti)
  * 
  ***************************************************************************/
 static PWP_BOOL
-closeGridFile(CAEP_RTITEM *pRti)
+closeGridFile(const CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    int idNc = tau.idNc;
+    TAU_DATA &tau = *(rti.tau);
+    const int idNc = tau.idNc;
     return OK(nc_close(idNc));
 }
 
@@ -1731,173 +1436,149 @@ closeGridFile(CAEP_RTITEM *pRti)
  * Writes out the TAU boundary mapping file.
  * 
  ***************************************************************************/
-static PWP_BOOL
-writeBmapFile(CAEP_RTITEM *pRti)
+static bool
+writeBmapFile(const CAEP_RTITEM &rti)
 {
-    TAU_DATA &tau = *(pRti->tau);
-    PWP_BOOL ret = PWP_TRUE;
+    const TAU_DATA &tau = *(rti.tau);
+    std::string file(rti.pWriteInfo->fileDest);
+    file += ".bmap";
+    FILE *fp = pwpFileOpen(file.c_str(), pwpWrite | pwpAscii);
+    bool ret = (nullptr != fp);
+    if (ret) {
+        ret = ret && 0 < fprintf(fp,
+                " -----------------------------------------------------\n");
+        ret = ret && 0 < fprintf(fp, " BOUNDARY MAPPING\n");
+        ret = ret && 0 < fprintf(fp,
+                " -----------------------------------------------------\n");
 
-    char strBmap[1024];
-    sprintf(strBmap, "%s.%s", pRti->pWriteInfo->fileDest, "bmap");
-    FILE *fp = pwpFileOpen(strBmap, pwpWrite | pwpAscii);
+        const StringUINT32Map &mNameToId = tau.nameToId;
+        const StringStringMap &mNameToType = tau.nameToType;
+        StringUINT32Map::const_iterator it = mNameToId.begin();
+        for (; it != mNameToId.end() && ret; ++it) {
+            const std::string &name = it->first;
+            const PWP_UINT32 outputID = it->second;
+            const char *type = mNameToType.at(name).c_str();
+            ret = ret && 0 < fprintf(fp, "\n");
+            ret = ret && 0 < fprintf(fp, "%26s %u\n", "Markers:", outputID);
+            ret = ret && 0 < fprintf(fp, "%26s %s\n", "Type:", type);
+            ret = ret && 0 < fprintf(fp, "%26s %s\n", "Name:", name.c_str());
+            // future attributes added here
+            ret = ret && 0 < fprintf(fp, "\n");
+            ret = ret && 0 < fprintf(fp, " block end\n");
+            ret = ret && 0 < fprintf(fp, " ---------------------------\n");
+        }
 
-    // ensure file pointer is valid
-    if (!fp) {
-        return PWP_FALSE;
+        pwpFileClose(fp);
     }
-
-    ret = ret && 0 < fprintf(fp,
-            " -----------------------------------------------------\n");
-    ret = ret && 0 < fprintf(fp, " BOUNDARY MAPPING\n");
-    ret = ret && 0 < fprintf(fp,
-            " -----------------------------------------------------\n");
-
-    StringUINT32Map &mNameToId = tau.mapNameToOutputID;
-    StringUINT32Map::iterator iterIds;
-    StringStringMap &mNameToType = tau.mapNameToType;
-    for (iterIds = mNameToId.begin(); iterIds != mNameToId.end() && ret;
-            ++iterIds) {
-        const char *name = iterIds->first.c_str();
-        PWP_UINT32 outputID = iterIds->second;
-        const char *type = mNameToType[iterIds->first].c_str();
-        ret = ret && 0 < fprintf(fp, "\n");
-        ret = ret && 0 < fprintf(fp, "%26s %u\n", "Markers:", outputID);
-        ret = ret && 0 < fprintf(fp, "%26s %s\n", "Type:", type);
-        ret = ret && 0 < fprintf(fp, "%26s %s\n", "Name:", name);
-        // future attributes added here
-        ret = ret && 0 < fprintf(fp, "\n");
-        ret = ret && 0 < fprintf(fp, " block end\n");
-        ret = ret && 0 < fprintf(fp, " ---------------------------\n");
-    }
-
-    pwpFileClose(fp);
-
     return ret;
 }
 
 
 /**************************************/
 PWP_BOOL
-runtimeWrite(CAEP_RTITEM *pRti, PWGM_HGRIDMODEL model,
-             const CAEP_WRITEINFO *pWriteInfo)
+runtimeWrite(CAEP_RTITEM *pRti, PWGM_HGRIDMODEL, const CAEP_WRITEINFO *)
 {
+    // attach runtime instance data to pRti
+    TAU_DATA tauData;     // will persist for entire export
+    pRti->tau = &tauData; // cppcheck-suppress autoVariables
+
     PWP_BOOL ret = PWP_TRUE;
-    TAU_DATA data = {0};
-    pRti->tau = &data; // cppcheck-suppress autoVariables
-    // Checks if the user is using 2D or 3D
-    PWP_BOOL dim = CAEPU_RT_DIM_2D(pRti);
-    PWP_UINT32 cnt;
-
-    if (pRti && model && pWriteInfo) {
-        if(dim)
-        {
-            cnt = 2; /* the # of MAJOR progress steps 2D */
+    const PWP_UINT32 NumMajorSteps = (is2D(*pRti) ? 2 : 3);
+    if (caeuProgressInit(pRti, NumMajorSteps)) {
+        // These first four functions are the same for 2D and 3D.
+        if (!setupMarkerInfo(*pRti)) {
+            caeuSendErrorMsg(pRti, "Could not setup marker info!", 0);
+            ret = false;
         }
-        else
-        {
-            cnt = 3; /* the # of MAJOR progress steps 3D */
+        else if (!startGridFile(*pRti)) {
+            caeuSendErrorMsg(pRti, "Could start grid file info!", 0);
+            ret = false;
         }
-        
-
-        if (caeuProgressInit(pRti, cnt)) {
-            
-            // These first four functions are the same for 2D and 3D.
-            if (!setupMarkerInfo(pRti)) {
-                caeuSendErrorMsg(pRti, "Could not setup marker info!", 0);
-                ret = false;
-            }
-            else if (!startGridFile(pRti)) {
-                caeuSendErrorMsg(pRti, "Could start grid file info!", 0);
-                ret = false;
-            }
-            else if (!definePointVars(pRti)) {
-                caeuSendErrorMsg(pRti, "Could not define point vars!", 0);
-                ret = false;
-            }
-            else if (!defineMarkers(pRti)) {
-                caeuSendErrorMsg(pRti, "Could not define markers!", 0);
-                ret = false;
-            }
-            // The 2D and 3D exports now differ.
-            if(dim)
-            {
-                if(!defineElementVars2D(pRti)) {
-                    caeuSendErrorMsg(pRti, "Could not define element vars!", 0);
-                    ret = false;
-                }
-                else if (!endFileDefinition(pRti)) {
-                    caeuSendErrorMsg(pRti, "Could not create TAU file! If "
-                        "writing a large file, ensure that the solver "
-                        "attribute 'dataModel' is not set to classic.",
-                        0);
-                    ret = false;
-                }
-                // first major progress step
-                else if(!writePointVars2D(pRti)) {
-                    caeuSendErrorMsg(pRti, "Could not write point vars!", 0);
-                    ret = false;
-                }
-                else if(!writeMarkers(pRti)) {
-                    caeuSendErrorMsg(pRti, "Could not write markers!", 0);
-                    ret = false;
-                }
-                // second major progress step
-                else if(!writeElementVars2D(pRti)) {
-                    caeuSendErrorMsg(pRti, "Could not write element vars!", 0);
-                    ret = false;
-                }
-            }
-            else
-            {
-                if (!defineElementVars(pRti)) {
-                    caeuSendErrorMsg(pRti, "Could not define element vars!", 0);
-                    ret = false;
-                }
-                else if (!defineSurfaceElementVars(pRti)) {
-                    caeuSendErrorMsg(pRti, "Could not define surface element "
-                        "vars!", 0);
-                    ret = false;
-                }
-                else if (!endFileDefinition(pRti)) {
-                    caeuSendErrorMsg(pRti, "Could not create TAU file! If "
-                        "writing a large file, ensure that the solver "
-                        "attribute 'dataModel' is not set to classic.",
-                        0);
-                    ret = false;
-                }
-                // first major progress step
-                else if (!writePointVars(pRti)) {
-                    caeuSendErrorMsg(pRti, "Could not write point vars!", 0);
-                    ret = false;
-                }
-                // second major progress step
-                else if (!writeElementVars(pRti)) {
-                    caeuSendErrorMsg(pRti, "Could not write element vars!", 0);
-                    ret = false;
-                }
-                else if (!writeMarkers(pRti)) {
-                    caeuSendErrorMsg(pRti, "Could not write markers!", 0);
-                    ret = false;
-                }
-                // third major step
-                else if (!writeSurfaceElementVars(pRti)) {
-                    caeuSendErrorMsg(pRti, "Could not write surface element "
-                        "vars!", 0);
-                    ret = false;
-                }
-            }
-            // Attempt to close file even if previous step failed.
-            if (!closeGridFile(pRti)) {
-                ret = false;
-            }
-
-            ret = ret && writeBmapFile(pRti);
-
-            caeuProgressEnd(pRti, ret);
-            ret = ret && !pRti->opAborted;
+        else if (!definePointVars(*pRti)) {
+            caeuSendErrorMsg(pRti, "Could not define point vars!", 0);
+            ret = false;
         }
+        else if (!defineMarkers(*pRti)) {
+            caeuSendErrorMsg(pRti, "Could not define markers!", 0);
+            ret = false;
+        }
+
+        // The 2D and 3D exports now differ.
+        if (is2D(*pRti)) {
+            if (!defineElementVars2D(*pRti)) {
+                caeuSendErrorMsg(pRti, "Could not define element vars!", 0);
+                ret = false;
+            }
+            else if (!endFileDefinition(*pRti)) {
+                caeuSendErrorMsg(pRti, "Could not create TAU file! If "
+                    "writing a large file, ensure that the solver "
+                    "attribute 'dataModel' is not set to classic.",
+                    0);
+                ret = false;
+            }
+            // first major progress step
+            else if (!writePointVars2D(*pRti)) {
+                caeuSendErrorMsg(pRti, "Could not write point vars!", 0);
+                ret = false;
+            }
+            else if (!writeMarkers(*pRti)) {
+                caeuSendErrorMsg(pRti, "Could not write markers!", 0);
+                ret = false;
+            }
+            // second major progress step
+            else if (!writeElementVars2D(*pRti)) {
+                caeuSendErrorMsg(pRti, "Could not write element vars!", 0);
+                ret = false;
+            }
+        }
+        else {
+            if (!defineElementVars(*pRti)) {
+                caeuSendErrorMsg(pRti, "Could not define element vars!", 0);
+                ret = false;
+            }
+            else if (!defineSurfaceElementVars(*pRti)) {
+                caeuSendErrorMsg(pRti, "Could not define surface element "
+                    "vars!", 0);
+                ret = false;
+            }
+            else if (!endFileDefinition(*pRti)) {
+                caeuSendErrorMsg(pRti, "Could not create TAU file! If "
+                    "writing a large file, ensure that the solver "
+                    "attribute 'dataModel' is not set to classic.",
+                    0);
+                ret = false;
+            }
+            // first major progress step
+            else if (!writePointVars3D(*pRti)) {
+                caeuSendErrorMsg(pRti, "Could not write point vars!", 0);
+                ret = false;
+            }
+            // second major progress step
+            else if (!writeElementVars(*pRti)) {
+                caeuSendErrorMsg(pRti, "Could not write element vars!", 0);
+                ret = false;
+            }
+            else if (!writeMarkers(*pRti)) {
+                caeuSendErrorMsg(pRti, "Could not write markers!", 0);
+                ret = false;
+            }
+            // third major step
+            else if (!writeSurfaceElementVars(*pRti)) {
+                caeuSendErrorMsg(pRti, "Could not write surface element "
+                    "vars!", 0);
+                ret = false;
+            }
+        }
+        // Attempt to close file even if previous step failed.
+        if (!closeGridFile(*pRti)) {
+            ret = false;
+        }
+        else if (ret) {
+            ret = writeBmapFile(*pRti);
+        }
+        caeuProgressEnd(pRti, ret);
     }
-    return ret;
+    return ret && !pRti->opAborted;
 }
 
 
