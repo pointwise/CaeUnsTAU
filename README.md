@@ -7,10 +7,11 @@ This plugin was created with the `mkplugin` options `-c` and `-caeu`.
 
 See [How To Integrate Plugin Code][HowTo] for details.
 
-This plugin statically links against the following third party libraries.
- * [netcdf][netcdf]
- * [hdf5][hdf5]
- * [zlib][zlib]
+This plugin statically links against the following third party libraries. Newer
+versions may work but have not been tested.
+ * [netcdf v4.6.1][netcdf]
+ * [hdf5 v1.8.20][hdf5]
+ * [zlib v1.2.8][zlib]
    * Usually, zlib is only downloaded for win64 builds. The `libz` library is usually part of the OS on linux and macosx platforms.
 
 You must add the appropriate include path and link library settings to your TAU plugin project when building with Visual Studio on win64.
