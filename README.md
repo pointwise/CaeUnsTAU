@@ -30,26 +30,36 @@ For example,
 PluginSDK/
    external/
       common/
+         hdf5/
+            hdf5.h
+            hdf5_hl.h
+            H5*.h    <-- many the other hdf5 common headers
          netcdf/
             netcdf.h
+         zlib/
+            zlib.h
+            zconf.h
       linux_x86_64/
          netcdf/
             libnetcdf.lib
          hdf5/
             libhdf5.a
             libhdf5_hl.a
+            H5pubconf.h
       macosx/
          netcdf/
             libnetcdf.a
          hdf5/
             libhdf5.a
             libhdf5_hl.a
+            H5pubconf.h
       win64/
          netcdf/
             netcdf.lib
          hdf5/
             hdf5.lib
             hdf5_hl.lib
+            H5pubconf.h
          zlib/
             zlib.lib
 ```
