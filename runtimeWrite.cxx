@@ -41,16 +41,15 @@
 #include "pwpPlatform.h"
 
 
- // DO NOT CHANGE THE ORDER OF INCLUSION FOR THE FILES BELOW!
-// <string>, <map>, and <netcdf.h> MUST be included in the order they are below
-#include <string.h>
-#include <string>
-#include <map>
-#include <netcdf.h>
 #include <array>
-#include <hdf5.h>
+#include <cmath>
+#include <map>
 #include <memory>
 #include <sstream>
+#include <string>
+
+#include <hdf5.h>
+#include <netcdf.h>
 #include <zlib.h>
 
 
@@ -298,13 +297,14 @@ static bool
 startGridFile(const CAEP_RTITEM &rti)
 {
     TAU_DATA &tau = *(rti.tau);
+    const std::string type("Primary Grid: Tau Format");
     std::string file(rti.pWriteInfo->fileDest);
     file += ".grid";
     int dataModel = 0;
     return getDataModel(rti, dataModel) &&
-           OK(nc_create(file.c_str(), NC_CLOBBER | dataModel, &tau.idNc)) &&
-           OK(nc_put_att_text(tau.idNc, NC_GLOBAL, "type", 24,
-               "Primary Grid: Tau Format"));
+        OK(nc_create(file.c_str(), NC_CLOBBER | dataModel, &tau.idNc)) &&
+        OK(nc_put_att_text(tau.idNc, NC_GLOBAL, "type", type.size(),
+            type.c_str()));
 }
 
 
@@ -324,7 +324,7 @@ definePointVars(const CAEP_RTITEM &rti)
     tau.numPoints = PwModVertexCount(rti.model);
 
     // If 2D, the number of points is doubled because the 2D faces will be
-    // extruded one step in either the +z or -z direction. This will implicitly
+    // extruded one step in either the +Y or -Y direction. This will implicitly
     // create a second set of points that are the exact same order as the
     // original set, simply offset by the number of original points.
     // For instance, given a 2D grid with 8 points indexed 0-7, there will be 8
@@ -414,26 +414,6 @@ defineElementVars(const CAEP_RTITEM &rti)
 
 /****************************************************************************
  * 
- * The defineOneMarker(CAEP_RTITEM) function
- * 
- * helper for defineMarkers(CAEP_RTITEM) function.
- *
- * Defines a marker attribute based on the condition name and id of a marker.
- * 
- ***************************************************************************/
-static bool
-defineOneMarker(const CAEP_RTITEM &rti, const char *name, const int id)
-{
-    const TAU_DATA &tau = *(rti.tau);
-    char attrName[10];
-    const size_t len = strlen(name) + 1; // +1 for null character
-    return (0 < sprintf(attrName, "marker_%d", id)) &&
-        OK(nc_put_att_text(tau.idNc, NC_GLOBAL, attrName, len, name));
-}
-
-
-/****************************************************************************
- * 
  * The defineMarkers(CAEP_RTITEM) function
  * 
  * Defines the marker variable and marker attributes (attributes are defined
@@ -445,15 +425,16 @@ defineMarkers(const CAEP_RTITEM &rti)
 {
     TAU_DATA &tau = *(rti.tau);
     int ncNumMarkers = 0;
-    bool ret = OK(nc_def_dim(tau.idNc, "no_of_markers", tau.nameToId.size(),
-        &ncNumMarkers)) && OK(nc_def_var(tau.idNc, "marker", NC_INT, 1,
-            &ncNumMarkers, &tau.idMarker));
+    bool ret = OK(nc_def_dim(tau.idNc, "no_of_markers",
+            tau.nameToId.size(), &ncNumMarkers)) &&
+        OK(nc_def_var(tau.idNc, "marker", NC_INT, 1, &ncNumMarkers,
+            &tau.idMarker));
     if (ret) {
-        StringUINT32Map::const_iterator it = tau.nameToId.begin();
-        for (; it != tau.nameToId.end(); ++it) {
-            const char *key = it->first.c_str();
-            const PWP_UINT32 value = it->second;
-            if (!defineOneMarker(rti, key, value)) {
+        for (auto it = tau.nameToId.cbegin(); tau.nameToId.end() != it; ++it) {
+            std::ostringstream attr;
+            attr << "marker_" << it->second;
+            if (!OK(nc_put_att_text(tau.idNc, NC_GLOBAL, attr.str().c_str(),
+                    it->first.size(), it->first.c_str()))) {
                 ret = false;
                 break;
             }
@@ -814,8 +795,7 @@ createExtrudedQuadTopElement(const CAEP_RTITEM &rti, const PWP_UINT32 idxQuad,
         (int)(data.index[2] + tau.numPoints),
         (int)(data.index[3] + tau.numPoints)
     };
-    return OK(nc_put_vara_int(tau.idNc, tau.idQuads, start, count,
-            indices)) &&
+    return OK(nc_put_vara_int(tau.idNc, tau.idQuads, start, count, indices)) &&
         OK(nc_put_var1_int(tau.idNc, tau.numSurfBndryMarkers, &adjIdx,
             (int*)&markerID)) &&
         createHexFromQuad(rti, data);
@@ -952,38 +932,50 @@ get2DGridOrientation(CAEP_RTITEM &rti, Orientation &orient)
     };
 
     auto getBlkOrientation = [&setCoords, &coords](const PWP_UINT32 blkNdx,
-        Orientation &orient)
+        Orientation &orient, bool &isYAligned)
     {
         const bool ret = setCoords(blkNdx);
         if (ret) {
-            const PWGM_XYZVAL v1[3]{
+            const PWGM_XYZVAL a[3]{
                 coords[1][0] - coords[0][0],
                 coords[1][1] - coords[0][1],
                 coords[1][2] - coords[0][2]
             };
-            const PWGM_XYZVAL v2[3]{
+            const PWGM_XYZVAL b[3]{
                 coords[2][0] - coords[0][0],
                 coords[2][1] - coords[0][1],
                 coords[2][2] - coords[0][2]
             };
-            // THIS ASSUMES THE GRID IS CONSTRUCTED IN the XY PLANE:
-            // The orientation is determined by the the z component of
-            // (v1 cross v2).
+            // THIS ASSUMES THE GRID IS CONSTRUCTED IN the XZ PLANE:
+            // The orientation is determined by the the Y component of
+            // (a cross b).
             // The cross product formula:
-            //   <cx, cy, cz> = < ay*bz - az*by, az*bx - ax*bz, ax*by - ay*bx >
-            const PWP_REAL crossZ = (v1[0] * v2[1]) - (v1[1] * v2[0]);
-            orient = (crossZ > 0.0) ? Orientation::Pos : Orientation::Neg;
+            //   <cx, cy, cz> = < ay*bz-az*by, az*bx-ax*bz, ax*by-ay*bx >
+            enum { X, Y, Z };
+            const PWP_REAL cX = (a[Y] * b[Z]) - (a[Z] * b[Y]); // ay*bz-az*by
+            const PWP_REAL cY = (a[Z] * b[X]) - (a[X] * b[Z]); // az*bx-ax*bz
+            const PWP_REAL cZ = (a[X] * b[Y]) - (a[Y] * b[X]); // ax*by-ay*bx
+            // TODO: improve mesh alignment processing
+            const PWP_REAL Tol = 1e-6;
+            if (std::abs(cX) > Tol) {
+                isYAligned = false; // mesh normal is NOT Y-aligned
+            }
+            if (std::abs(cZ) > Tol) {
+                isYAligned = false; // mesh normal is NOT Y-aligned
+            }
+            orient = (cY > 0.0) ? Orientation::Pos : Orientation::Neg;
         }
         return ret;
     };
 
     // assume orient of first block is same for all blocks
-    bool ret = getBlkOrientation(0, orient);
+    bool isYAligned = true; // may be set to false by getBlkOrientation()
+    bool ret = getBlkOrientation(0, orient, isYAligned);
     if (ret) {
         const PWP_UINT32 numBlocks = PwModBlockCount(rti.model);
         for (PWP_UINT32 ii = 1; ii < numBlocks; ++ii) {
             Orientation iiOrient;
-            if (!getBlkOrientation(ii, iiOrient)) {
+            if (!getBlkOrientation(ii, iiOrient, isYAligned)) {
                 ret = false;
                 break;
             }
@@ -992,6 +984,9 @@ get2DGridOrientation(CAEP_RTITEM &rti, Orientation &orient)
                 caeuSendWarningMsg(&rti, "Non-uniform domain orientation.", 0);
                 break;
             }
+        }
+        if (ret && !isYAligned) {
+            caeuSendWarningMsg(&rti, "2-D grid normal should be Y-aligned.", 0);
         }
     }
     return ret;
@@ -1096,7 +1091,7 @@ writePointVars3D(CAEP_RTITEM &rti)
  * 
  * Iterate through the vertices in the Pointwise model and save their xyz
  * coordinates to their respective TAU variables. For 2D, this process is
- * repeated, offsetting the z component by the amount defined by the user.
+ * repeated, offsetting the Y component by the amount defined by the user.
  * 
  ***************************************************************************/
 static bool
@@ -1110,9 +1105,9 @@ writePointVars2D(CAEP_RTITEM &rti)
         get2DGridOrientation(rti, dir) &&
         PwModGetAttributeREAL(rti.model, Thickness, &thickness) &&
         writePtCoordArray(rti, PWGM_XYZ_X, Passes) &&
-        writePtCoordArray(rti, PWGM_XYZ_Y, Passes) &&
-        writePtCoordArray(rti, PWGM_XYZ_Z, Passes, thickness *
-            static_cast<PWP_REAL>(dir));
+        writePtCoordArray(rti, PWGM_XYZ_Y, Passes, thickness *
+            static_cast<PWP_REAL>(dir)) &&
+        writePtCoordArray(rti, PWGM_XYZ_Z, Passes);
     return caeuProgressEndStep(&rti) && ret;
 }
 
@@ -1227,8 +1222,8 @@ writeElementVars2D(CAEP_RTITEM &rti)
                         (int)data.index[1],
                         (int)data.index[0]
                     };
-                    if (!OK(nc_put_vara_int(idNc, tau.idTris, start,
-                            count, indices))) {
+                    if (!OK(nc_put_vara_int(idNc, tau.idTris, start, count,
+                            indices))) {
                         ret = false;
                         break;
                     }
@@ -1258,8 +1253,8 @@ writeElementVars2D(CAEP_RTITEM &rti)
                         (int)data.index[1],
                         (int)data.index[0]
                     };
-                    if (!OK(nc_put_vara_int(idNc, tau.idQuads, start,
-                            count, indices))) {
+                    if (!OK(nc_put_vara_int(idNc, tau.idQuads, start, count,
+                            indices))) {
                         ret = false;
                         break;
                     }
@@ -1363,8 +1358,8 @@ writeSurfaceElementVars(CAEP_RTITEM &rti)
                         (int)data.index[1],
                         (int)data.index[0]
                     };
-                    if (!OK(nc_put_vara_int(tau.idNc, tau.idTris, start,
-                            count, indices))) {
+                    if (!OK(nc_put_vara_int(tau.idNc, tau.idTris, start, count,
+                            indices))) {
                         ret = false;
                         break;
                     }
@@ -1390,8 +1385,8 @@ writeSurfaceElementVars(CAEP_RTITEM &rti)
                         (int)data.index[1],
                         (int)data.index[0]
                     };
-                    if (!OK(nc_put_vara_int(tau.idNc, tau.idQuads, start,
-                            count, indices))) {
+                    if (!OK(nc_put_vara_int(tau.idNc, tau.idQuads, start, count,
+                            indices))) {
                         ret = false;
                         break;
                     }
@@ -1453,14 +1448,13 @@ writeBmapFile(const CAEP_RTITEM &rti)
 
         const StringUINT32Map &mNameToId = tau.nameToId;
         const StringStringMap &mNameToType = tau.nameToType;
-        StringUINT32Map::const_iterator it = mNameToId.begin();
-        for (; it != mNameToId.end() && ret; ++it) {
+        for (auto it = mNameToId.cbegin(); it != mNameToId.end() && ret; ++it) {
             const std::string &name = it->first;
             const PWP_UINT32 outputID = it->second;
-            const char *type = mNameToType.at(name).c_str();
+            const std::string &type = mNameToType.at(name);
             ret = ret && 0 < fprintf(fp, "\n");
             ret = ret && 0 < fprintf(fp, "%26s %u\n", "Markers:", outputID);
-            ret = ret && 0 < fprintf(fp, "%26s %s\n", "Type:", type);
+            ret = ret && 0 < fprintf(fp, "%26s %s\n", "Type:", type.c_str());
             ret = ret && 0 < fprintf(fp, "%26s %s\n", "Name:", name.c_str());
             // future attributes added here
             ret = ret && 0 < fprintf(fp, "\n");
