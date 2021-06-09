@@ -1,4 +1,5 @@
-## Building the TAU CAE Export Plugin
+# Building the TAU CAE Export Plugin
+Copyright 2021 Cadence Design Systems, Inc. All rights reserved worldwide.
 
 To build the **TAU** CAE export plugin you must integrate the source code from 
 this repository into your local PluginSDK installation.
@@ -68,3 +69,8 @@ PluginSDK/
 [netcdf]: https://www.unidata.ucar.edu/downloads/netcdf/
 [hdf5]: https://www.hdfgroup.org/
 [zlib]: http://www.zlib.net/
+
+## Disclaimer
+This file is licensed under the Cadence Public License Version 1.0 (the "License"), a copy of which is found in the LICENSE file, and is distributed "AS IS." 
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, CADENCE DISCLAIMS ALL WARRANTIES AND IN NO EVENT SHALL BE LIABLE TO ANY PARTY FOR ANY DAMAGES ARISING OUT OF OR RELATING TO USE OF THIS FILE. 
+Please see the License for the full text of applicable terms.
